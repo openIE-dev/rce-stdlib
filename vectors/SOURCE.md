@@ -978,3 +978,47 @@ mutant removed, noted in its header).
 - `vectors/data/sync/automerge_map.json` sha256 `6c1a591d2304a154e80a50c7b8eb0239b4d4278a7ef063c9a76e3ab37f0c3617`
 - `vectors/data/sync/fast_json_patch.json` sha256 `59e159c6000c9218fb48cf6df94d1316955916bc64ddf62e40cc3414e55aa1ad`
 - `vectors/data/sync/pg_subscriptions.json` sha256 `134cb8582f750b1496ed7297ed798929197cc190e8c5008adc769175dcb10751`
+## ml.ad, ml.tensor, ml.prob (`lib/ml/`)
+
+No upstream vector files: every vector is derived by a generator from
+pinned references, and written into `tests/ml/*.rce`.
+
+- `scripts/gen/ml_ad_gen.py` (PyTorch 2.9.0+cpu, JAX 0.6.2, mpmath
+  1.3.0): 11 straight-line programs (the tape's full op set) at 24 points
+  each; values, gradients and JVPs bit for bit against the Python tape
+  model `scripts/ref/ml/mlref.py`; gradients against
+  `torch.autograd` after `torch.autograd.gradcheck` passes, cross-checked
+  with `jax.grad` (max relative difference 6.4e-16,
+  `vectors/ml/ad_ref.tsv`); Hessians and Hessian-vector products bit for
+  bit against the model and against `torch.autograd.functional.hessian`
+  (checked with `jax.hessian`, 5.3e-16); a third derivative against
+  PyTorch and JAX; central differences. Elementary functions bit for bit
+  against the model; sin and cos at 71 large arguments (2^21 to 2^1023
+  and the Kahan-McDonald worst case 6381956970095103 * 2^797) within 1 ulp
+  of mpmath at 2500 bits. 1,943 checks.
+- `scripts/gen/ml_tensor_gen.py` (PyTorch 2.9 float64): reductions under
+  each tree bit for bit against a Python model; matmul, log-softmax, two
+  MLP families and an RMSNorm/softplus/gate/residual block (loss and every
+  gradient) against PyTorch, plus central differences; 12 steps of SGD
+  and Adam against `torch.optim`; f32 and f64 raw bits; the binary64
+  FabricExec probe digests of the engine (`openIE-dev/rce`
+  `spec/checker/src/host.rs` at b497ce3, from an instrumented
+  `probe_fabric` run, reproduced by `scripts/ref/ml/fabric_exec_ref.py`)
+  and the finite part of each probe recomputed in RCE bit for bit;
+  Ferric's published f32 probe digests (`2a5bf3731421828e` from the
+  Rust replica `scripts/ref/ml/ferric_probe`, `ddeeb58c50f5ae9f`
+  published for six substrates). 132 checks.
+- `scripts/gen/ml_prob_gen.py` (posteriordb stan-dev/posteriordb 91027f9,
+  PyTorch, NumPy): log densities and gradients of Rate_1, eight schools
+  noncentered, kidiq (kidscore_momiq), sblri-blr and a correlated
+  Gaussian against PyTorch; uniform and normal draws bit for bit against
+  the Python model of rand.det; split R-hat and ESS against NumPy;
+  Cholesky, dense kinetic energy and dense momentum draws against NumPy;
+  leapfrog reversibility under diagonal and dense metrics; replay of
+  seeded HMC and NUTS runs. 59 comptime checks. `tests/ml/prob_emit.rce`
+  (41 lines, emitted Rust, `scripts/nightly.sh`) runs NUTS (4 chains,
+  500 + 500) against the posteriordb reference means and sds (10 chains
+  x 1000 draws), including dense-metric runs on kidiq and on the
+  correlated Gaussian (rho 0.99, sds 1 and 10), and ADVI.
+
+Mutation testing: `scripts/mut/ml.py`.

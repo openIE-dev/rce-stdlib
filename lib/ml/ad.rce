@@ -1,0 +1,883 @@
+module ml.ad
+
+# Automatic differentiation (ml.ad, spec/proposals/ml.md). Pure RCE on
+# f64, which is IEEE 754 binary64 with round to nearest even and no
+# contraction (6.3 N3): every `a * b + c` is two roundings on every target.
+# The elementary functions that RCE does not provide (exp, ln, log1p,
+# expm1, tanh, sigmoid, sin, cos) are written here with a fixed operation
+# order, so their bits are the same wherever + - * / and sqrt are
+# correctly rounded. They follow fdlibm 5.3 (Sun, 1993) kernels.
+#
+# Two modes over one Wengert list (Griewank and Walther, Evaluating
+# Derivatives, 2nd ed., ch. 3):
+# - `Tape` records each operation once; `grad` is the reverse sweep
+#   (adjoints, one pass for all inputs) and `jvp` the forward sweep
+#   (tangents along one direction, one pass per direction).
+# - `Dual` numbers give forward mode with no tape.
+# Adjoints are summed in node order (the reverse sweep visits nodes from
+# last to first), so a gradient is a fixed sequence of roundings.
+# A non-finite intermediate is a trap (6.3 N3), never a value.
+
+pub const LN2_HI: f64 = 0.6931471803691238
+pub const LN2_LO: f64 = 1.9082149292705877e-10
+pub const INV_LN2: f64 = 1.4426950408889634
+pub const PI: f64 = 3.141592653589793
+
+const P1: f64 = 0.16666666666666602
+const P2: f64 = -0.0027777777777015593
+const P3: f64 = 6.613756321437934e-05
+const P4: f64 = -1.6533902205465252e-06
+const P5: f64 = 4.1381367970572385e-08
+
+const LG1: f64 = 0.6666666666666735
+const LG2: f64 = 0.3999999999940942
+const LG3: f64 = 0.2857142874366239
+const LG4: f64 = 0.22222198432149784
+const LG5: f64 = 0.1818357216161805
+const LG6: f64 = 0.15313837699209373
+const LG7: f64 = 0.14798198605116586
+const SQRT2: f64 = 1.4142135623730951
+
+# 2^k, exact for -1074 <= k <= 1023 (products of powers of two).
+pub fn pow2(k: i64) -> f64
+    var r = 1.0
+    var n = k
+    var b = 2.0
+    if n < 0
+        n = 0 - n
+        b = 0.5
+    var sq = b
+    while n > 0 bound 64
+        if n % 2 == 1
+            r = r * sq
+        n = n / 2
+        if n > 0
+            sq = sq * sq
+    return r
+
+# x * 2^k without an intermediate overflow or a double rounding above the
+# subnormal range (split in two steps when k is large).
+pub fn ldexp(x: f64, k: i64) -> f64
+    if k > 1000
+        return x * pow2(1000) * pow2(k - 1000)
+    if k < -1000
+        return x * pow2(-1000) * pow2(k + 1000)
+    return x * pow2(k)
+
+# The exponent e with 2^e <= |x| < 2^(e+1), x != 0 (exact comparisons).
+pub fn ilogb(x: f64) -> i64
+    var a = x.abs()
+    var e = 0
+    if a < pow2(-1000)
+        a = a * pow2(1000)
+        e = -1000
+    for s in [512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+        if a >= pow2(s)
+            a = a * pow2(0 - s)
+            e += s
+    for s in [512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+        if a < pow2(1 - s)
+            a = a * pow2(s)
+            e -= s
+    return e
+
+# exp: fdlibm e_exp.c (k = round(x / ln 2), Remez polynomial on
+# |r| <= ln2/2). Below -745.14 the result is 0; above 709.78 it traps.
+pub fn exp(x: f64) -> f64
+    if x == 0.0
+        return 1.0
+    if x < -745.1332191019412
+        return 0.0
+    let half = if x < 0.0 then -0.5 else 0.5
+    let k = (x * INV_LN2 + half) as i64
+    let kf = k as f64
+    let hi = x - kf * LN2_HI
+    let lo = kf * LN2_LO
+    let r = hi - lo
+    let t = r * r
+    let c = r - t * (P1 + t * (P2 + t * (P3 + t * (P4 + t * P5))))
+    let y = 1.0 - ((lo - (r * c) / (2.0 - c)) - hi)
+    return ldexp(y, k)
+
+# ln: fdlibm e_log.c (x = 2^k (1+f), sqrt(2)/2 <= 1+f < sqrt(2)).
+pub fn ln(x: f64) -> f64
+    if x <= 0.0
+        return 0.0 / 0.0
+    if x == 1.0
+        return 0.0
+    var k = ilogb(x)
+    var m = ldexp(x, 0 - k)
+    if m >= SQRT2
+        m = m * 0.5
+        k += 1
+    let f = m - 1.0
+    let dk = k as f64
+    let s = f / (2.0 + f)
+    let z = s * s
+    let w = z * z
+    let t1 = w * (LG2 + w * (LG4 + w * LG6))
+    let t2 = z * (LG1 + w * (LG3 + w * (LG5 + w * LG7)))
+    let rr = t2 + t1
+    let hfsq = 0.5 * f * f
+    return dk * LN2_HI - ((hfsq - (s * (hfsq + rr) + dk * LN2_LO)) - f)
+
+# expm1: Horner Taylor series on |x| < 0.35 (18 terms, truncation below
+# 2^-60 relative), exp(x) - 1 elsewhere.
+pub fn expm1(x: f64) -> f64
+    if x.abs() < 0.35
+        var p = 1.0
+        var n = 18
+        while n >= 2 bound 20
+            p = 1.0 + x * p / (n as f64)
+            n -= 1
+        return x * p
+    return exp(x) - 1.0
+
+# log1p: Goldberg's correction (What Every Computer Scientist Should Know
+# About Floating-Point Arithmetic, Thm 4): u = 1 + x rounded, and
+# ln(u) * x / (u - 1) when u != 1.
+pub fn log1p(x: f64) -> f64
+    let u = 1.0 + x
+    if u == 1.0
+        return x
+    return ln(u) * (x / (u - 1.0))
+
+pub fn tanh(x: f64) -> f64
+    let a = x.abs()
+    if a > 22.0
+        return if x < 0.0 then -1.0 else 1.0
+    let e = expm1(2.0 * a)
+    let t = e / (e + 2.0)
+    return if x < 0.0 then 0.0 - t else t
+
+pub fn sigmoid(x: f64) -> f64
+    if x >= 0.0
+        return 1.0 / (1.0 + exp(0.0 - x))
+    let e = exp(x)
+    return e / (1.0 + e)
+
+# log(1 + exp(x)) without overflow.
+pub fn softplus(x: f64) -> f64
+    if x > 36.0
+        return x + exp(0.0 - x)
+    if x < -36.0
+        return exp(x)
+    if x > 0.0
+        return x + log1p(exp(0.0 - x))
+    return log1p(exp(x))
+
+const S1: f64 = -0.16666666666666632
+const S2: f64 = 0.00833333333332249
+const S3: f64 = -0.0001984126982985795
+const S4: f64 = 2.7557313707070068e-06
+const S5: f64 = -2.5050760253406863e-08
+const S6: f64 = 1.58969099521155e-10
+const C1: f64 = 0.0416666666666666
+const C2: f64 = -0.001388888888887411
+const C3: f64 = 2.480158728947673e-05
+const C4: f64 = -2.7557314351390663e-07
+const C5: f64 = 2.087572321298175e-09
+const C6: f64 = -1.1359647557788195e-11
+
+fn ksin(x: f64) -> f64
+    let z = x * x
+    let v = z * x
+    let r = S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)))
+    return x + v * (S1 + z * r)
+
+fn kcos(x: f64) -> f64 = kcos2(x, 0.0)
+
+# ---- Payne and Hanek reduction for every finite |x| >= pi/4
+
+const PIO2_H: f64 = 1.5707963267948966
+const PIO2_L: f64 = 6.123233995736766e-17
+const SPLIT: f64 = 134217729.0
+
+# 2/pi as 66 base-2^24 digits (1584 bits), most significant first.
+fn two_over_pi() -> List[i64] = [10680707, 7228996, 1387004, 2578385, 16069853, 12639074, 9804092, 4427841, 16666979, 11263675, 12935607, 2387514, 4345298, 14681673, 3074569, 13734428, 16653803, 1880361, 10960616, 8533493, 3062596, 8710556, 7349940, 6258241, 3772886, 3769171, 3798172, 8675211, 12450088, 3874808, 9961438, 366607, 15675153, 9132554, 7151469, 3571407, 2607881, 12013382, 4155038, 6285869, 7677882, 13102053, 15825725, 473591, 9065106, 15363067, 6271263, 9264392, 5636912, 4652155, 7056368, 13614112, 10155062, 1944035, 9527646, 15080200, 6658437, 6231200, 6832269, 16767104, 5075751, 3212806, 1398474, 7579849, 6349435, 12618859]
+
+# a * b as an unevaluated sum p + e, exactly (Dekker; no FMA).
+fn two_prod(a: f64, b: f64) -> (f64, f64)
+    let p = a * b
+    let ta = SPLIT * a
+    let ah = ta - (ta - a)
+    let al = a - ah
+    let tb = SPLIT * b
+    let bh = tb - (tb - b)
+    let bl = b - bh
+    let e = ((ah * bh - p) + ah * bl + al * bh) + al * bl
+    return (p, e)
+
+# fdlibm 5.3 __kernel_sin(x, y, 1) and __kernel_cos(x, y) (k_sin.c,
+# k_cos.c): x + y is the reduced argument as a double-double.
+fn ksin2(x: f64, y: f64) -> f64
+    let z = x * x
+    let v = z * x
+    let r = S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)))
+    return x - ((z * (0.5 * y - v * r) - y) - v * S1)
+
+fn kcos2(x: f64, y: f64) -> f64
+    let z = x * x
+    let r = z * (C1 + z * (C2 + z * (C3 + z * (C4 + z * (C5 + z * C6)))))
+    let a = x.abs()
+    if a < 0.2999999523162842
+        return 1.0 - (0.5 * z - (z * r - x * y))
+    var qx = 0.28125
+    if a < 0.7812504768371582
+        # |x| / 4 with the low 32 bits of its significand cleared
+        let q = 0.25 * a
+        let e = ilogb(q)
+        qx = ldexp((ldexp(q, 20 - e)).floor(), e - 20)
+    let hz = 0.5 * z - qx
+    let w = 1.0 - qx
+    return w - (hz - (z * r - x * y))
+
+# x = n pi/2 + (y0 + y1), |y0 + y1| <= pi/4, returning (n mod 4, y0, y1).
+# x = m 2^s with m < 2^53 an integer. Digits of 2/pi whose products with
+# m are multiples of 4 are skipped; the next 10 digits give the integer
+# part mod 4 and at least 160 fraction bits, computed exactly in 24-bit
+# limbs; the fraction is rounded to the nearest integer, and its leading
+# 120 bits (after any cancellation) times pi/2 are formed in
+# double-double. Worst cases of Kahan and McDonald (x = 6381956970095103
+# 2^797) are among the checks.
+pub fn ph_reduce(x: f64) -> (i64, f64, f64)
+    let tp = two_over_pi()
+    let a = x.abs()
+    let e = ilogb(a)
+    let m = ldexp(a, 52 - e) as i64
+    let ms = [m >> 48, (m >> 24) & 16777215, m & 16777215]
+    let s = e - 52
+    let j0 = if s >= 2 then (s - 2) / 24 else 0
+    var d: List[i64] = []
+    for _ in 0..13
+        d.push(0)
+    for j in 0..10
+        for k in 0..3
+            let at = (j + k + 1) as usize
+            d[at] = d[at] + tp[(j0 + j) as usize] * ms[k as usize]
+    var i = 12
+    while i > 0 bound 13
+        let iu = i as usize
+        d[iu - 1] = d[iu - 1] + (d[iu] >> 24)
+        d[iu] = d[iu] & 16777215
+        i -= 1
+    let f = 24 * (j0 + 10) - s
+    let r = (24 - f % 24) % 24
+    if r > 0
+        var sh: List[i64] = [0]
+        for v in d
+            sh.push(v)
+        for q in 0..(sh.len() - 1)
+            sh[q] = ((sh[q] << r) & 16777215) | (sh[q + 1] >> (24 - r))
+        let last = sh.len() - 1
+        sh[last] = (sh[last] << r) & 16777215
+        d = sh
+    let nf = ((f + r) / 24) as usize
+    let start = d.len() - nf
+    var fr: List[i64] = []
+    for q in start..d.len()
+        fr.push(d[q])
+    var n = d[start - 1] & 3
+    var flip = false
+    if fr[0] >= 8388608
+        n = (n + 1) & 3
+        flip = true
+        var b = 0
+        var q = fr.len()
+        while q > 0 bound 64
+            q -= 1
+            let v = 0 - fr[q] - b
+            b = if v < 0 then 1 else 0
+            fr[q] = v + (b << 24)
+    var z: usize = 0
+    while fr[z] == 0 bound 64
+        z += 1
+    for _ in 0..5
+        fr.push(0)
+    let zi = z as i64
+    let ah = ldexp((fr[z] * 16777216 + fr[z + 1]) as f64, -24 * (zi + 2))
+    let bh = ldexp((fr[z + 2] * 16777216 + fr[z + 3]) as f64, -24 * (zi + 4))
+    let ch = ldexp(fr[z + 4] as f64, -24 * (zi + 5))
+    let fh = ah + bh
+    let fl = (bh - (fh - ah)) + ch
+    let (p, pe0) = two_prod(fh, PIO2_H)
+    let pe = pe0 + (fh * PIO2_L + fl * PIO2_H)
+    var y0 = p + pe
+    var y1 = pe - (y0 - p)
+    if flip
+        y0 = 0.0 - y0
+        y1 = 0.0 - y1
+    if x < 0.0
+        n = (4 - n) & 3
+        y0 = 0.0 - y0
+        y1 = 0.0 - y1
+    return (n, y0, y1)
+
+fn sin_big(x: f64) -> f64
+    let (n, y0, y1) = ph_reduce(x)
+    if n == 0
+        return ksin2(y0, y1)
+    if n == 1
+        return kcos2(y0, y1)
+    if n == 2
+        return 0.0 - ksin2(y0, y1)
+    return 0.0 - kcos2(y0, y1)
+
+fn cos_big(x: f64) -> f64
+    let (n, y0, y1) = ph_reduce(x)
+    if n == 0
+        return kcos2(y0, y1)
+    if n == 1
+        return 0.0 - ksin2(y0, y1)
+    if n == 2
+        return 0.0 - kcos2(y0, y1)
+    return ksin2(y0, y1)
+
+pub fn sin(x: f64) -> f64
+    if x.abs() < 0.7853981633974483
+        return ksin(x)
+    return sin_big(x)
+
+pub fn cos(x: f64) -> f64
+    if x.abs() < 0.7853981633974483
+        return kcos(x)
+    return cos_big(x)
+
+# atan (fdlibm 5.3 s_atan.c): reduction to |x| < 7/16 by the identities
+# of atan(1/2), atan(1), atan(3/2) and pi/2, then an odd polynomial.
+const AT0: f64 = 0.3333333333333293
+const AT1: f64 = -0.19999999999876483
+const AT2: f64 = 0.14285714272503466
+const AT3: f64 = -0.11111110405462356
+const AT4: f64 = 0.09090887133436507
+const AT5: f64 = -0.0769187620504483
+const AT6: f64 = 0.06661073137387531
+const AT7: f64 = -0.058335701337905735
+const AT8: f64 = 0.049768779946159324
+const AT9: f64 = -0.036531572744216916
+const AT10: f64 = 0.016285820115365782
+
+fn atan_hi(id: i64) -> f64 = if id == 0 then 0.4636476090008061 else (if id == 1 then 0.7853981633974483 else (if id == 2 then 0.982793723247329 else 1.5707963267948966))
+fn atan_lo(id: i64) -> f64 = if id == 0 then 2.2698777452961687e-17 else (if id == 1 then 3.061616997868383e-17 else (if id == 2 then 1.3903311031230998e-17 else 6.123233995736766e-17))
+
+pub fn atan(x0: f64) -> f64
+    let a = x0.abs()
+    if a >= 7.378697629483821e+19
+        let r = atan_hi(3) + atan_lo(3)
+        return if x0 < 0.0 then 0.0 - r else r
+    var x = x0
+    var id = -1
+    if a < 0.4375
+        if a < 1.862645149230957e-09
+            return x0
+    else
+        x = a
+        if a < 1.1875
+            if a < 0.6875
+                id = 0
+                x = (2.0 * x - 1.0) / (2.0 + x)
+            else
+                id = 1
+                x = (x - 1.0) / (x + 1.0)
+        else
+            if a < 2.4375
+                id = 2
+                x = (x - 1.5) / (1.0 + 1.5 * x)
+            else
+                id = 3
+                x = -1.0 / x
+    let z = x * x
+    let w = z * z
+    let s1 = z * (AT0 + w * (AT2 + w * (AT4 + w * (AT6 + w * (AT8 + w * AT10)))))
+    let s2 = w * (AT1 + w * (AT3 + w * (AT5 + w * (AT7 + w * AT9))))
+    if id < 0
+        return x - x * (s1 + s2)
+    let r = atan_hi(id) - ((x * (s1 + s2) - atan_lo(id)) - x)
+    return if x0 < 0.0 then 0.0 - r else r
+
+# x^y for x > 0 as exp(y ln x) (faithful to the error of exp and ln, not
+# correctly rounded).
+pub fn pow(x: f64, y: f64) -> f64 = exp(y * ln(x))
+
+# x^n for an integer n by repeated squaring (exact order fixed).
+pub fn powi(x: f64, n: i64) -> f64
+    var r = 1.0
+    var m = if n < 0 then 0 - n else n
+    var b = x
+    while m > 0 bound 64
+        if m % 2 == 1
+            r = r * b
+        m = m / 2
+        if m > 0
+            b = b * b
+    return if n < 0 then 1.0 / r else r
+
+# ---------------------------------------------------------------- forward
+
+pub struct Dual
+    v: f64
+    d: f64
+
+pub fn dual(v: f64, d: f64) -> Dual = Dual(v: v, d: d)
+pub fn dconst(v: f64) -> Dual = Dual(v: v, d: 0.0)
+pub fn dadd(a: Dual, b: Dual) -> Dual = Dual(v: a.v + b.v, d: a.d + b.d)
+pub fn dsub(a: Dual, b: Dual) -> Dual = Dual(v: a.v - b.v, d: a.d - b.d)
+pub fn dmul(a: Dual, b: Dual) -> Dual = Dual(v: a.v * b.v, d: a.d * b.v + a.v * b.d)
+pub fn ddiv(a: Dual, b: Dual) -> Dual
+    let q = a.v / b.v
+    return Dual(v: q, d: (a.d - q * b.d) / b.v)
+pub fn dneg(a: Dual) -> Dual = Dual(v: 0.0 - a.v, d: 0.0 - a.d)
+pub fn dexp(a: Dual) -> Dual
+    let e = exp(a.v)
+    return Dual(v: e, d: e * a.d)
+pub fn dln(a: Dual) -> Dual = Dual(v: ln(a.v), d: a.d / a.v)
+pub fn dsqrt(a: Dual) -> Dual
+    let s = a.v.sqrt()
+    return Dual(v: s, d: a.d / (2.0 * s))
+pub fn dtanh(a: Dual) -> Dual
+    let t = tanh(a.v)
+    return Dual(v: t, d: (1.0 - t * t) * a.d)
+pub fn dsigmoid(a: Dual) -> Dual
+    let s = sigmoid(a.v)
+    return Dual(v: s, d: s * (1.0 - s) * a.d)
+pub fn dsin(a: Dual) -> Dual = Dual(v: sin(a.v), d: cos(a.v) * a.d)
+pub fn dcos(a: Dual) -> Dual = Dual(v: cos(a.v), d: 0.0 - sin(a.v) * a.d)
+pub fn dpowi(a: Dual, n: i64) -> Dual = Dual(v: powi(a.v, n), d: (n as f64) * powi(a.v, n - 1) * a.d)
+
+# ---------------------------------------------------------------- tape
+
+# Operation codes. Unary ops leave b = -1; CONST and INPUT have no args.
+pub const INPUT: i64 = 0
+pub const CONST: i64 = 1
+pub const ADD: i64 = 2
+pub const SUB: i64 = 3
+pub const MUL: i64 = 4
+pub const DIV: i64 = 5
+pub const NEG: i64 = 6
+pub const EXP: i64 = 7
+pub const LN: i64 = 8
+pub const SQRT: i64 = 9
+pub const TANH: i64 = 10
+pub const SIGMOID: i64 = 11
+pub const SIN: i64 = 12
+pub const COS: i64 = 13
+pub const POWI: i64 = 14
+pub const RELU: i64 = 15
+pub const SOFTPLUS: i64 = 16
+pub const LOG1P: i64 = 17
+pub const EXPM1: i64 = 18
+pub const RECIP: i64 = 19
+pub const ABS: i64 = 20
+pub const MAX: i64 = 21
+pub const MIN: i64 = 22
+pub const POW: i64 = 23
+pub const ATAN: i64 = 24
+# STEP(x) = 1 for x > 0, 0 for x < 0, and at 0 the tie value k / 2
+# (k = 0 or 1). Its derivative is 0 everywhere; it carries the
+# piecewise-constant partials of RELU, ABS, MAX and MIN on a tape.
+pub const STEP: i64 = 25
+
+# A Wengert list. Node i has op[i], args a[i], b[i] (node indices, -1 when
+# absent), an integer parameter k[i] (POWI exponent) and its value val[i].
+pub struct Tape
+    op: List[i64]
+    a: List[i64]
+    b: List[i64]
+    k: List[i64]
+    val: List[f64]
+    inputs: List[i64]
+
+pub fn tape() -> Tape = Tape(op: [], a: [], b: [], k: [], val: [], inputs: [])
+
+fn push(t: &mut Tape, op: i64, a: i64, b: i64, k: i64, v: f64) -> i64
+    t.op.push(op)
+    t.a.push(a)
+    t.b.push(b)
+    t.k.push(k)
+    t.val.push(v)
+    return (t.val.len() as i64) - 1
+
+pub fn value(t: &Tape, i: i64) -> f64 = t.val[i as usize]
+pub fn size(t: &Tape) -> i64 = t.val.len() as i64
+
+pub fn input(t: &mut Tape, x: f64) -> i64
+    let i = push(t, INPUT, -1, -1, 0, x)
+    t.inputs.push(i)
+    return i
+
+pub fn constant(t: &mut Tape, x: f64) -> i64 = push(t, CONST, -1, -1, 0, x)
+
+pub fn add(t: &mut Tape, i: i64, j: i64) -> i64
+    let v = t.val[i as usize] + t.val[j as usize]
+    return push(t, ADD, i, j, 0, v)
+pub fn sub(t: &mut Tape, i: i64, j: i64) -> i64
+    let v = t.val[i as usize] - t.val[j as usize]
+    return push(t, SUB, i, j, 0, v)
+pub fn mul(t: &mut Tape, i: i64, j: i64) -> i64
+    let v = t.val[i as usize] * t.val[j as usize]
+    return push(t, MUL, i, j, 0, v)
+pub fn div(t: &mut Tape, i: i64, j: i64) -> i64
+    let v = t.val[i as usize] / t.val[j as usize]
+    return push(t, DIV, i, j, 0, v)
+pub fn neg(t: &mut Tape, i: i64) -> i64
+    let v = 0.0 - t.val[i as usize]
+    return push(t, NEG, i, -1, 0, v)
+pub fn texp(t: &mut Tape, i: i64) -> i64
+    let v = exp(t.val[i as usize])
+    return push(t, EXP, i, -1, 0, v)
+pub fn tln(t: &mut Tape, i: i64) -> i64
+    let v = ln(t.val[i as usize])
+    return push(t, LN, i, -1, 0, v)
+pub fn tsqrt(t: &mut Tape, i: i64) -> i64
+    let v = t.val[i as usize].sqrt()
+    return push(t, SQRT, i, -1, 0, v)
+pub fn ttanh(t: &mut Tape, i: i64) -> i64
+    let v = tanh(t.val[i as usize])
+    return push(t, TANH, i, -1, 0, v)
+pub fn tsigmoid(t: &mut Tape, i: i64) -> i64
+    let v = sigmoid(t.val[i as usize])
+    return push(t, SIGMOID, i, -1, 0, v)
+pub fn tsin(t: &mut Tape, i: i64) -> i64
+    let v = sin(t.val[i as usize])
+    return push(t, SIN, i, -1, 0, v)
+pub fn tcos(t: &mut Tape, i: i64) -> i64
+    let v = cos(t.val[i as usize])
+    return push(t, COS, i, -1, 0, v)
+pub fn tpowi(t: &mut Tape, i: i64, n: i64) -> i64
+    let v = powi(t.val[i as usize], n)
+    return push(t, POWI, i, -1, n, v)
+# relu'(0) = 0, as in PyTorch and JAX.
+pub fn trelu(t: &mut Tape, i: i64) -> i64
+    let x = t.val[i as usize]
+    let v = if x > 0.0 then x else 0.0
+    return push(t, RELU, i, -1, 0, v)
+pub fn tsoftplus(t: &mut Tape, i: i64) -> i64
+    let v = softplus(t.val[i as usize])
+    return push(t, SOFTPLUS, i, -1, 0, v)
+pub fn tlog1p(t: &mut Tape, i: i64) -> i64
+    let v = log1p(t.val[i as usize])
+    return push(t, LOG1P, i, -1, 0, v)
+pub fn texpm1(t: &mut Tape, i: i64) -> i64
+    let v = expm1(t.val[i as usize])
+    return push(t, EXPM1, i, -1, 0, v)
+pub fn trecip(t: &mut Tape, i: i64) -> i64
+    let v = 1.0 / t.val[i as usize]
+    return push(t, RECIP, i, -1, 0, v)
+# abs'(0) = 0, as in PyTorch and JAX.
+pub fn tabs(t: &mut Tape, i: i64) -> i64
+    let v = t.val[i as usize].abs()
+    return push(t, ABS, i, -1, 0, v)
+# max and min split the gradient evenly at a tie, as torch.maximum and
+# jnp.maximum do.
+pub fn tmax(t: &mut Tape, i: i64, j: i64) -> i64
+    let x = t.val[i as usize]
+    let z = t.val[j as usize]
+    let v = if x >= z then x else z
+    return push(t, MAX, i, j, 0, v)
+pub fn tmin(t: &mut Tape, i: i64, j: i64) -> i64
+    let x = t.val[i as usize]
+    let z = t.val[j as usize]
+    let v = if x <= z then x else z
+    return push(t, MIN, i, j, 0, v)
+# x^z for x > 0.
+pub fn tpow(t: &mut Tape, i: i64, j: i64) -> i64
+    let v = pow(t.val[i as usize], t.val[j as usize])
+    return push(t, POW, i, j, 0, v)
+pub fn tatan(t: &mut Tape, i: i64) -> i64
+    let v = atan(t.val[i as usize])
+    return push(t, ATAN, i, -1, 0, v)
+fn stepv(x: f64, tie: i64) -> f64
+    if x > 0.0
+        return 1.0
+    if x < 0.0
+        return 0.0
+    return if tie == 1 then 0.5 else 0.0
+pub fn tstep(t: &mut Tape, i: i64, tie: i64) -> i64
+    let v = stepv(t.val[i as usize], tie)
+    return push(t, STEP, i, -1, tie, v)
+
+# Partial derivatives of node i with respect to its first and second
+# argument, from the recorded values.
+fn partials(t: &Tape, i: usize) -> (f64, f64)
+    let o = t.op[i]
+    let y = t.val[i]
+    let x = if t.a[i] >= 0 then t.val[t.a[i] as usize] else 0.0
+    let z = if t.b[i] >= 0 then t.val[t.b[i] as usize] else 0.0
+    if o == ADD
+        return (1.0, 1.0)
+    if o == SUB
+        return (1.0, -1.0)
+    if o == MUL
+        return (z, x)
+    if o == DIV
+        return (1.0 / z, 0.0 - y / z)
+    if o == NEG
+        return (-1.0, 0.0)
+    if o == EXP
+        return (y, 0.0)
+    if o == LN
+        return (1.0 / x, 0.0)
+    if o == SQRT
+        return (0.5 / y, 0.0)
+    if o == TANH
+        return (1.0 - y * y, 0.0)
+    if o == SIGMOID
+        return (y * (1.0 - y), 0.0)
+    if o == SIN
+        return (cos(x), 0.0)
+    if o == COS
+        return (0.0 - sin(x), 0.0)
+    if o == POWI
+        return ((t.k[i] as f64) * powi(x, t.k[i] - 1), 0.0)
+    if o == RELU
+        return (if x > 0.0 then 1.0 else 0.0, 0.0)
+    if o == SOFTPLUS
+        return (sigmoid(x), 0.0)
+    if o == LOG1P
+        return (1.0 / (1.0 + x), 0.0)
+    if o == EXPM1
+        return (y + 1.0, 0.0)
+    if o == RECIP
+        return (0.0 - y * y, 0.0)
+    if o == ABS
+        return (stepv(x, 0) - stepv(0.0 - x, 0), 0.0)
+    if o == MAX
+        return (stepv(x - z, 1), stepv(z - x, 1))
+    if o == MIN
+        return (stepv(z - x, 1), stepv(x - z, 1))
+    if o == POW
+        return ((z * y) / x, y * ln(x))
+    if o == ATAN
+        return (1.0 / (1.0 + x * x), 0.0)
+    return (0.0, 0.0)
+
+# Reverse sweep: adjoints of every node for the output node `out`
+# (seed 1). The gradient with respect to the inputs, in input order, is
+# `grad`.
+pub fn adjoints(t: &Tape, out: i64) -> List[f64]
+    let n = t.val.len()
+    var g: List[f64] = []
+    for _ in 0..n
+        g.push(0.0)
+    g[out as usize] = 1.0
+    var i = out
+    while i >= 0 bound 1099511627776
+        let u = i as usize
+        let gi = g[u]
+        if gi != 0.0 and t.a[u] >= 0 and t.op[u] != STEP
+            let (pa, pb) = partials(t, u)
+            let ja = t.a[u] as usize
+            g[ja] = g[ja] + gi * pa
+            if t.b[u] >= 0
+                let jb = t.b[u] as usize
+                g[jb] = g[jb] + gi * pb
+        i -= 1
+    return g
+
+pub fn grad(t: &Tape, out: i64) -> List[f64]
+    let g = adjoints(t, out)
+    var r: List[f64] = []
+    for i in t.inputs
+        r.push(g[i as usize])
+    return r
+
+# Forward sweep: the directional derivative of every node along the input
+# tangent `dir` (one entry per input); returns the tangent of `out`.
+pub fn jvp(t: &Tape, out: i64, dir: &[f64]) -> f64
+    let n = t.val.len()
+    var d: List[f64] = []
+    for _ in 0..n
+        d.push(0.0)
+    var q: usize = 0
+    for i in t.inputs
+        d[i as usize] = dir[q]
+        q += 1
+    for u in 0..n
+        if t.a[u] >= 0
+            let (pa, pb) = partials(t, u)
+            var s = pa * d[t.a[u] as usize]
+            if t.b[u] >= 0
+                s = s + pb * d[t.b[u] as usize]
+            d[u] = s
+    return d[out as usize]
+
+# The full Jacobian-free check helper: sum of a list of nodes, left to
+# right (a fixed order).
+pub fn tape_sum(t: &mut Tape, xs: &[i64]) -> i64
+    var acc = xs[0]
+    var q: usize = 1
+    while q < xs.len() bound 1099511627776
+        acc = add(t, acc, xs[q])
+        q += 1
+    return acc
+
+# ---------------------------------------------------------------- nested AD
+
+# The partials of node u as nodes on the same tape, built from the ops
+# whose values `partials` computes, with the same roundings, so their
+# values equal `partials` bit for bit. c1, cm1, chalf are constant nodes.
+fn partial_nodes(t: &mut Tape, u: i64, c1: i64, cm1: i64, chalf: i64) -> (i64, i64)
+    let iu = u as usize
+    let o = t.op[iu]
+    let a = t.a[iu]
+    let b = t.b[iu]
+    if o == ADD
+        return (c1, c1)
+    if o == SUB
+        return (c1, cm1)
+    if o == MUL
+        return (b, a)
+    if o == DIV
+        let pa = div(t, c1, b)
+        let q = div(t, u, b)
+        let pb = neg(t, q)
+        return (pa, pb)
+    if o == NEG
+        return (cm1, -1)
+    if o == EXP
+        return (u, -1)
+    if o == LN
+        let pa = div(t, c1, a)
+        return (pa, -1)
+    if o == SQRT
+        let pa = div(t, chalf, u)
+        return (pa, -1)
+    if o == TANH
+        let sq = mul(t, u, u)
+        let pa = sub(t, c1, sq)
+        return (pa, -1)
+    if o == SIGMOID
+        let om = sub(t, c1, u)
+        let pa = mul(t, u, om)
+        return (pa, -1)
+    if o == SIN
+        let pa = tcos(t, a)
+        return (pa, -1)
+    if o == COS
+        let sn = tsin(t, a)
+        let pa = neg(t, sn)
+        return (pa, -1)
+    if o == POWI
+        let kk = t.k[iu]
+        let ck = constant(t, kk as f64)
+        let pwn = tpowi(t, a, kk - 1)
+        let pa = mul(t, ck, pwn)
+        return (pa, -1)
+    if o == RELU
+        let pa = tstep(t, a, 0)
+        return (pa, -1)
+    if o == SOFTPLUS
+        let pa = tsigmoid(t, a)
+        return (pa, -1)
+    if o == LOG1P
+        let den = add(t, c1, a)
+        let pa = div(t, c1, den)
+        return (pa, -1)
+    if o == EXPM1
+        let pa = add(t, u, c1)
+        return (pa, -1)
+    if o == RECIP
+        let sq = mul(t, u, u)
+        let pa = neg(t, sq)
+        return (pa, -1)
+    if o == ABS
+        let sp = tstep(t, a, 0)
+        let na = neg(t, a)
+        let sm = tstep(t, na, 0)
+        let pa = sub(t, sp, sm)
+        return (pa, -1)
+    if o == MAX
+        let d1 = sub(t, a, b)
+        let d2 = sub(t, b, a)
+        let pa = tstep(t, d1, 1)
+        let pb = tstep(t, d2, 1)
+        return (pa, pb)
+    if o == MIN
+        let d1 = sub(t, b, a)
+        let d2 = sub(t, a, b)
+        let pa = tstep(t, d1, 1)
+        let pb = tstep(t, d2, 1)
+        return (pa, pb)
+    if o == POW
+        let zy = mul(t, b, u)
+        let pa = div(t, zy, a)
+        let la = tln(t, a)
+        let pb = mul(t, u, la)
+        return (pa, pb)
+    if o == ATAN
+        let sq = mul(t, a, a)
+        let den = add(t, c1, sq)
+        let pa = div(t, c1, den)
+        return (pa, -1)
+    return (-1, -1)
+
+fn acc_node(t: &mut Tape, g: &mut List[i64], j: i64, c: i64)
+    let ju = j as usize
+    if g[ju] < 0
+        g[ju] = c
+    else
+        let s = add(t, g[ju], c)
+        g[ju] = s
+
+# Reverse mode recorded on the tape itself (the adjoint program as new
+# nodes), returning the tape and one gradient node per input. The new
+# nodes are ordinary tape nodes, so every mode applies to them again:
+# reverse over reverse gives Hessians, forward over reverse gives
+# Hessian-vector products, and nesting further gives higher derivatives.
+# Each node's derivative is an explicit node of a distinct tape region,
+# so perturbations of different levels cannot be confused (Siskind and
+# Pearlmutter's perturbation confusion does not arise without lambda
+# capture). Gradient values equal `grad` (adjoints in the same order with
+# the same roundings; zero adjoints are kept here, so a derivative that
+# vanishes at the point but not nearby is not lost).
+pub fn grad_tape(t0: Tape, out: i64) -> (Tape, List[i64])
+    var t = t0
+    let n = t.val.len()
+    var g: List[i64] = []
+    for _ in 0..n
+        g.push(-1)
+    let c1 = constant(&mut t, 1.0)
+    let cm1 = constant(&mut t, -1.0)
+    let chalf = constant(&mut t, 0.5)
+    g[out as usize] = c1
+    var i = out
+    while i >= 0 bound 1099511627776
+        let u = i as usize
+        let gi = g[u]
+        if gi >= 0 and t.a[u] >= 0 and t.op[u] != STEP
+            let (pa, pb) = partial_nodes(&mut t, i, c1, cm1, chalf)
+            let ja = t.a[u]
+            let jb = t.b[u]
+            let ca = mul(&mut t, gi, pa)
+            acc_node(&mut t, &mut g, ja, ca)
+            if jb >= 0
+                let cb = mul(&mut t, gi, pb)
+                acc_node(&mut t, &mut g, jb, cb)
+        i -= 1
+    var r: List[i64] = []
+    let z = constant(&mut t, 0.0)
+    for k in t.inputs
+        let gk = g[k as usize]
+        r.push(if gk >= 0 then gk else z)
+    return (t, r)
+
+# The Hessian of `out` (row i is the gradient of the i-th gradient
+# entry): reverse over reverse, n + 1 sweeps. Rows are not symmetrised;
+# H[i][j] and H[j][i] are two roundings of the same derivative.
+pub fn hessian(t0: Tape, out: i64) -> List[List[f64]]
+    let (t, gs) = grad_tape(t0, out)
+    var h: List[List[f64]] = []
+    for gi in gs
+        let row = grad(&t, gi)
+        h.push(row)
+    return h
+
+# Hessian-vector product H v: forward over reverse, one forward sweep of
+# the gradient program along v.
+pub fn hvp(t0: Tape, out: i64, v: &[f64]) -> List[f64]
+    let (t, gs) = grad_tape(t0, out)
+    var r: List[f64] = []
+    for gi in gs
+        let x = jvp(&t, gi, v)
+        r.push(x)
+    return r
