@@ -5,29 +5,27 @@
 # Usage: RCE=path/to/rce python3 scripts/mut/ml.py
 import glob, os, shutil, subprocess, sys, tempfile
 RCE = os.environ.get('RCE', 'rce')
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../..')
+root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../..'))
 sys.path.insert(0, os.path.join(root, 'scripts'))
 import uses
 T = 'tests/ml/'
-AD = [T + 'ad_checks.rce', T + 'ad_checks_0.rce', T + 'ad_checks_1.rce']
-HS = [T + 'ad_checks_hess_0.rce', T + 'ad_checks_hess_1.rce']
-TE = [T + 'tensor_checks.rce', T + 'tensor_checks_0.rce']
-TP = [T + 'tensor_checks_place.rce', T + 'tensor_checks_probe_1.rce', T + 'tensor_checks_probe.rce']
+# checks files are resharded for fuel (scripts/gen/ml_reshard.py), so
+# each group is a glob; a mutant stops at the first file that kills it
+G = lambda *ps: sorted(set(x[len(root) + 1:] for p in ps for x in glob.glob(os.path.join(root, T + p))))
+AD = G('ad_checks.rce', 'ad_checks_s*.rce', 'ad_checks_[0-9]*.rce')
+HS = G('ad_checks_hess_*.rce')
+TE = G('tensor_checks.rce', 'tensor_checks_s*.rce', 'tensor_checks_[0-9]*.rce')
+TP = G('tensor_checks_place*.rce', 'tensor_checks_probe*.rce')
 PR = [T + 'prob_checks.rce'] + sorted(glob.glob(os.path.join(root, T + 'prob_checks_*.rce')))
 M = [
-    # ml.ad: elementary functions
-    ('ad', '    let y = 1.0 - ((lo - (r * c) / (2.0 - c)) - hi)', '    let y = 1.0 - ((lo - (r * c) / (2.0 + c)) - hi)', AD),
-    ('ad', '    if m >= SQRT2\n', '    if m > 1.5\n', AD),
+    # ml.ad: elementary functions (exp, ln, sin, cos are math's, CR and
+    # mutation-tested there)
+    ('ad', 'pub fn ln(x: f64) -> f64 = math.log(x)', 'pub fn ln(x: f64) -> f64 = math.log2(x)', AD),
+    ('ad', '    return math.exp(x) - 1.0', '    return math.exp(x) - 0.5', AD),
     ('ad', '        while n >= 2 bound 20', '        while n >= 3 bound 20', AD),
     ('ad', '    if u == 1.0\n        return x\n    return ln(u) * (x / (u - 1.0))', '    if u == 1.0\n        return x\n    return ln(u)', AD),
     ('ad', '    let t = e / (e + 2.0)', '    let t = e / (e + 1.0)', AD),
-    ('ad', '    if x > 36.0\n        return x + exp(0.0 - x)', '    if x > 3.0\n        return x + exp(0.0 - x)', AD),
-    ('ad', '    let j0 = if s >= 2 then (s - 2) / 24 else 0', '    let j0 = if s >= 2 then (s - 2) / 24 + 1 else 0', AD),
-    ('ad', '    if fr[0] >= 8388608', '    if fr[0] >= 16777216', AD),
-    ('ad', '        n = (4 - n) & 3', '        n = n & 3', AD),
-    ('ad', '    let fl = (bh - (fh - ah)) + ch', '    let fl = ch', AD),
-    ('ad', '    return w - (hz - (z * r - x * y))', '    return w - (hz - z * r)', AD),
-    ('ad', '        qx = ldexp((ldexp(q, 20 - e)).floor(), e - 20)', '        qx = q', AD),
+    ('ad', '    if x > 36.0\n        return x + math.exp(0.0 - x)', '    if x > 3.0\n        return x + math.exp(0.0 - x)', AD),
     ('ad', '                x = (2.0 * x - 1.0) / (2.0 + x)', '                x = (2.0 * x - 1.0) / (2.0 - x)', AD),
     # ml.ad: sweeps and nested AD
     ('ad', '        return (1.0 / z, 0.0 - y / z)', '        return (1.0 / z, y / z)', AD),

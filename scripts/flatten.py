@@ -42,7 +42,31 @@ for a, _ in mods:
     for n in defs[a]:
         if any(n in defs[o] for o in defs if o != a):
             rename[(a, n)] = '%s_%s' % (a, n)
+# A local (let/var/for) in one module that has the name of another
+# module's top-level definition would shadow it once flattened (W-NAME-2),
+# so such locals get a trailing underscore in their own module.
+LOC = re.compile(r'\b(?:let|var|for)\s+([A-Za-z_]\w*)')
+texts = {a: '\n'.join(ls) for a, ls in mods}
+texts[None] = main
+alltop = set().union(*defs.values())
+PAR = re.compile(r'^(?:pub )?fn [^(]*\((.*)\)', re.M)
+def locs(t):
+    ns = set(LOC.findall(t))
+    for ps in PAR.findall(t):
+        ns |= set(re.findall(r'([A-Za-z_]\w*)\s*:', ps))
+    return ns
+shadow = {o: set(n for n in locs(t) if n in alltop and n not in defs[o]) for o, t in texts.items()}
 def fix(l, own):
+    for n in shadow[own]:
+        # not a field (x.n) or a field name or named argument (n: v)
+        if re.match(r'(?:pub )?fn ', l):
+            head, _, rest = l.partition(')')
+            head = re.sub(r'(?<![\w.])%s(?=\s*:)' % re.escape(n), n + '_', head)
+            l = head + _ + re.sub(r'(?<![\w.])%s\b(?!\s*:(?!:))' % re.escape(n), n + '_', rest)
+            continue
+        # a typed let/var names it before ':'; elsewhere 'n:' is a field
+        l = re.sub(r'^(\s*(?:let|var)\s+)%s(?=\s*:)' % re.escape(n), r'\g<1>' + n + '_', l)
+        l = re.sub(r'(?<![\w.])%s\b(?!\s*:(?!:))' % re.escape(n), n + '_', l)
     for (a, n), r in rename.items():
         l = re.sub(r'(?<![\w.])%s\.%s\b' % (re.escape(a), re.escape(n)), r, l)
         if a == own:
