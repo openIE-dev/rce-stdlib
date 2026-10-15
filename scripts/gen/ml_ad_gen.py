@@ -195,9 +195,11 @@ def main(root):
         if nm=='exp': xs+= [-745.0, 709.78, 1e-300, -1e-300, 0.5*math.log(2)]
         if nm=='atan': xs+=[1e30,-1e30,0.4375,1.1875,0.6875,2.4375,1e-10]
         ys=[f(x) for x in xs]
-        el.append(f'# {nm}\ncheck elem_bits({list(fx).index(nm)}, {L(xs)}, {L(ys)})')
-    # sin and cos at large arguments (Payne and Hanek, used for every |x| >= pi/4): bits against
-    # the model, and within 1 ulp of mpmath at 2000 bits (asserted here)
+        # 8 points per check: the correctly rounded functions are fuel-heavy
+        for c in range(0,len(xs),8):
+            el.append(f'# {nm}\ncheck elem_bits({list(fx).index(nm)}, {L(xs[c:c+8])}, {L(ys[c:c+8])})')
+    # sin and cos at large arguments: bits against the model, and correctly rounded
+    # against mpmath at 2500 bits (asserted here: error at most half an ulp)
     import mpmath; mpmath.mp.prec=2500
     big=[rnd.uniform(1,2)*2.0**rnd.randint(21,1023)*rnd.choice([-1.0,1.0]) for _ in range(60)]
     big+=[6381956970095103.0*2.0**797,-6381956970095103.0*2.0**797,5.319372648326541e+255,1.7976931348623157e308,-1.7976931348623157e308,1647099.0,-1647099.0,2.0**60,1e22,-1e22,1e300]
@@ -206,8 +208,9 @@ def main(root):
         ys=[f(x) for x in big]
         for x,y in zip(big,ys):
             ref=mf(mpmath.mpf(x)); u=mpmath.mpf(2)**(M.ilogb(abs(float(ref)))-52); e=float(abs(mpmath.mpf(y)-ref)/u); bigw=max(bigw,e)
-            assert e<1.0,(nm,x,e)
-        el.append(f'# {nm}, large |x| (Payne and Hanek)\ncheck elem_bits({list(fx).index(nm)}, {L(big)}, {L(ys)})')
+            assert e<=0.5,(nm,x,e)
+        for c in range(0,len(big),8):
+            el.append(f'# {nm}, large |x|\ncheck elem_bits({list(fx).index(nm)}, {L(big[c:c+8])}, {L(ys[c:c+8])})')
     print('sin/cos large-argument max ulp',bigw)
     ad_ext = ['check dual_matches_tape()', 'check trelu_zero()', 'check ties()', 'check math.pow2(-1074) == 5e-324', 'check math.pow2(1023) == 8.98846567431158e+307',
               'check ilogb(5e-324) == -1074', 'check ilogb(1.7976931348623157e+308) == 1023', 'check ilogb(1.0) == 0', 'check ilogb(0.75) == -1']
