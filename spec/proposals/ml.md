@@ -207,9 +207,9 @@ effective sample size by Geyer's initial monotone sequence.
 
 | Module | Checks | References |
 |---|---|---|
-| `ml.ad` | 1,943 | Python model of the tape (bit for bit: values, gradients, JVPs, Hessians, HVPs); PyTorch 2.9 float64 autograd after `gradcheck`, cross-checked with JAX 0.6 (gradients within 6.4e-16, Hessians within 5.3e-16 relative); central differences; mpmath for the elementary functions |
-| `ml.tensor` | 132 | Python model of each tree (bit for bit); PyTorch 2.9 float64 (layers, losses, gradients, 12 SGD and Adam steps); central differences; the engine's probe digests; Ferric's published digests |
-| `ml.prob` | 59 + 41 | PyTorch densities and gradients of five models; NumPy R-hat, ESS, Cholesky; Python model of the draws (bit for bit); reversibility; replay; posteriordb [P1] reference posteriors for Rate_1, eight schools (noncentered), kidiq, a Bayesian linear regression, and an analytic correlated Gaussian, under NUTS with diagonal and dense metrics and under ADVI |
+| `ml.ad` | 2,271 | Python model of the tape (bit for bit: values, gradients, JVPs, Hessians, HVPs); PyTorch 2.9 float64 autograd after `gradcheck`, cross-checked with JAX 0.6 (gradients within 6.4e-16, Hessians within 5.3e-16 relative); central differences; mpmath for the elementary functions |
+| `ml.tensor` | 132 | Python model of each tree (bit for bit); PyTorch 2.9 float64 (layers, losses, gradients, 6 SGD and Adam steps); central differences; the engine's probe digests; Ferric's published digests |
+| `ml.prob` | 63 + 41 | PyTorch densities and gradients of five models; NumPy R-hat, ESS, Cholesky; Python model of the draws (bit for bit); reversibility; replay; posteriordb [P1] reference posteriors for Rate_1, eight schools (noncentered), kidiq, a Bayesian linear regression, and an analytic correlated Gaussian, under NUTS with diagonal and dense metrics and under ADVI |
 
 Cross-target identity: every checks file is emitted to Python,
 JavaScript and Rust and must give identical observation lines
