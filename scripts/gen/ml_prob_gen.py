@@ -116,7 +116,7 @@ for i,(c,n,phi) in enumerate([(2,60,0.0),(4,50,0.6),(3,41,0.9)]):
     out.append(f'check rhat_ref({L(xs)}, {c}, {lit(np_rhat(xs,c))})')
     out.append(f'check ess_ref({L(xs)}, {c}, {lit(np_ess(xs,c))})')
 for sm in (0,1):
-    for mt in (0,1): out.append(f'check replay({sm}, {mt})')
+    for mt in (0,1): out += [f'check replay({sm}, {mt})', f'check reseed({sm}, {mt})']
 # dense metric pieces
 for i,d in enumerate((2,3,5)):
     A=np.array([[rnd.gauss(0,1) for _ in range(d)] for _ in range(d)]); A=A@A.T+0.5*np.eye(d)

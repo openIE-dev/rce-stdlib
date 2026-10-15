@@ -350,13 +350,21 @@ fn ess_ref(xs: List[f64], chains: i64, want: f64) -> bool = close(ess(&xs, chain
 
 fn small_run(b: i64, sampler: i64, metric: i64) -> List[List[f64]]
     let m = Model(dim: 2, data: [0.9, 1.0, 3.0])
-    let st = Settings(warmup: 16, draws: 10, chains: 2, steps: 4, delta: 0.8, max_depth: 4, metric: metric)
+    # NUTS doubles its trajectory, so its run is shorter and shallower
+    let w = if sampler == 1 then 6 else 12
+    let dr = if sampler == 1 then 3 else 6
+    let md = if sampler == 1 then 3 else 4
+    let st = Settings(warmup: w, draws: dr, chains: 2, steps: 4, delta: 0.8, max_depth: md, metric: metric)
     let sd = seed_of(b)
     let q0 = [0.3, -0.2]
     let f = sample(&m, corr2, &q0, &sd, &st, sampler)
     return f.draws
 
-fn replay(sampler: i64, metric: i64) -> bool = small_run(1, sampler, metric) == small_run(1, sampler, metric) and small_run(1, sampler, metric) != small_run(2, sampler, metric)
+# Replay: one seed gives the same draws twice; another seed differs.
+# (Two checks, so each stays inside one comptime fuel budget.)
+fn replay(sampler: i64, metric: i64) -> bool = small_run(1, sampler, metric) == small_run(1, sampler, metric)
+
+fn reseed(sampler: i64, metric: i64) -> bool = small_run(1, sampler, metric) != small_run(2, sampler, metric)
 
 # Dense metric pieces against NumPy: the Cholesky factor (and L L^T = A),
 # the kinetic energy p^T A p / 2, and momentum draws solving L^T p = z.
@@ -414,5 +422,5 @@ fn reversible_dense(a: List[f64], q0: List[f64], p0: List[f64], eps: f64, steps:
 
 fn density_ref_k(k: i64, q: List[f64], want: f64, wg: List[f64]) -> bool = density_ref(k, data_of(k), q, want, wg)
 
-check draw_ref([12.569148553044798, -3.82935590389767, 3.573162129756929, -1.5480352054326119, 3.174967200585818, -3.82935590389767, 4.158844962153512, 1.332187804515345, -0.39016325571600713, -1.598951653500934, 3.573162129756929, 1.332187804515345, 5.6609801642355855, -0.7956697922595592, -0.2643914317947471, -1.5480352054326119, -0.39016325571600713, -0.7956697922595592, 2.3216740503012376, 0.48473769931621824, 3.174967200585818, -1.598951653500934, -0.2643914317947471, 0.48473769931621824, 2.427138343981256], 5, 5)
-check reversible_dense([1.0, 2.7, 2.7, 9.0], [0.4, -1.1], [0.3, 0.8], 0.05, 20)
+check kinetic_ref([5.386847269578238, 0.38055621428047437, 0.12639447508056145, 0.38055621428047437, 3.9898825875547153, -1.463914512094086, 0.12639447508056145, -1.463914512094086, 1.1309608649433938], 3, [-0.2693737730628308, 1.073246860636291, 0.06674791017681102], 2.2786873848240887)
+check draw_ref([5.386847269578238, 0.38055621428047437, 0.12639447508056145, 0.38055621428047437, 3.9898825875547153, -1.463914512094086, 0.12639447508056145, -1.463914512094086, 1.1309608649433938], 3, 4)

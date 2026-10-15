@@ -87,13 +87,21 @@ fn ess_ref(xs: List[f64], chains: i64, want: f64) -> bool = close(ess(&xs, chain
 
 fn small_run(b: i64, sampler: i64, metric: i64) -> List[List[f64]]
     let m = Model(dim: 2, data: [0.9, 1.0, 3.0])
-    let st = Settings(warmup: 16, draws: 10, chains: 2, steps: 4, delta: 0.8, max_depth: 4, metric: metric)
+    # NUTS doubles its trajectory, so its run is shorter and shallower
+    let w = if sampler == 1 then 6 else 12
+    let dr = if sampler == 1 then 3 else 6
+    let md = if sampler == 1 then 3 else 4
+    let st = Settings(warmup: w, draws: dr, chains: 2, steps: 4, delta: 0.8, max_depth: md, metric: metric)
     let sd = seed_of(b)
     let q0 = [0.3, -0.2]
     let f = sample(&m, corr2, &q0, &sd, &st, sampler)
     return f.draws
 
-fn replay(sampler: i64, metric: i64) -> bool = small_run(1, sampler, metric) == small_run(1, sampler, metric) and small_run(1, sampler, metric) != small_run(2, sampler, metric)
+# Replay: one seed gives the same draws twice; another seed differs.
+# (Two checks, so each stays inside one comptime fuel budget.)
+fn replay(sampler: i64, metric: i64) -> bool = small_run(1, sampler, metric) == small_run(1, sampler, metric)
+
+fn reseed(sampler: i64, metric: i64) -> bool = small_run(1, sampler, metric) != small_run(2, sampler, metric)
 
 # Dense metric pieces against NumPy: the Cholesky factor (and L L^T = A),
 # the kinetic energy p^T A p / 2, and momentum draws solving L^T p = z.
