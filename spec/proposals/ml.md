@@ -60,34 +60,30 @@ logged probe digest equals the reference digest for that kernel class
 
 ## 2. Derivations
 
-### 2.1 Why the elementary functions are written here
+### 2.1 Where the elementary functions come from
 
-RCE has no transcendental functions (6.3 F9 [R1]): platform libraries differ
-in the last bit, which would violate R1. `ml.ad` therefore implements
-`exp`, `ln`, `expm1`, `log1p`, `tanh`, `sigmoid`, `softplus`, `sin`,
-`cos`, `atan` and `pow` from + - * / and sqrt in a fixed order. The
-results are not correctly rounded (F9 reserves that for a future
-CORE-MATH style library), but they are the same everywhere, which is
-what R1 needs. Accuracy is measured, not assumed: against mpmath at 300
-to 2500 bits, `sin` and `cos` are within 0.82 ulp over the whole finite
-range and `atan` within 1.0 ulp; the other functions were measured
-against glibc earlier (exp 1, ln 1, expm1 3, log1p 2, tanh 4 ulp).
+RCE has no built-in transcendental functions (6.3 F9 [R1]): platform
+libraries differ in the last bit, which would violate R1. `exp`, `ln`
+(as `math.log`), `sin` and `cos` are the correctly rounded binary64
+functions of this repository's `math` module (`lib/math/math.rce`,
+written in RCE with + - * / and sqrt only, after CORE-MATH), which
+`ml.ad` names on its `# uses:` line: the result is the double nearest the
+real value, for every finite argument, on every target. Payne and Hanek
+reduction for large trigonometric arguments now lives there.
+`ml.ad` builds the rest from them in a fixed order: `expm1` (Taylor
+series below 0.35, else `exp(x) - 1`), `log1p` (Goldberg's correction),
+`tanh`, `sigmoid`, `softplus` and `pow` (`exp(y ln x)`). These are not
+correctly rounded but are the same everywhere, which is what R1 needs.
+Measured against mpmath at 300 bits on 20,000 random arguments each:
+expm1 2.0, log1p 2.4, tanh 2.6, sigmoid 1.8, softplus 2.3 and atan 0.64
+ulp; `pow` loses about |y ln x| ulp (31.7 ulp for x in [0.01, 100],
+|y| <= 5) because the rounding of ln x is scaled by y.
 
-Trigonometric argument reduction. For |x| >= pi/4, x = n pi/2 + y with
-|y| <= pi/4 is computed exactly (Payne and Hanek method): x = m 2^s with
-m < 2^53 an integer; the digits of 2/pi (66 digits of 24 bits) whose
-product with m is a multiple of 4 are skipped, since they cannot change
-n mod 4 or the fraction; the next ten digits are multiplied by m in
-24-bit limbs, which is exact in i64; the product's integer part gives n
-mod 4 and its fraction at least 160 bits. The fraction is rounded to the
-nearest integer, its leading 120 bits after any cancellation are formed
-as a double-double and multiplied by pi/2 with Dekker's exact product
-(splitting by 2^27 + 1, no FMA). The kernels are fdlibm 5.3
-`__kernel_sin(x, y, 1)` and `__kernel_cos(x, y)` [F1, F2] on (y0, y1).
-The hardest case known for binary64, x = 6381956970095103 * 2^797, is
-among the checks.
+The correctly rounded functions cost far more interpreter fuel than the
+short kernels they replace, so the comptime checks are split into many
+files (`scripts/gen/ml_reshard.py` halves a file until each part fits).
 
-`atan` is fdlibm 5.3 `s_atan.c` [F3]: reduction by the addition formula
+`atan` is fdlibm 5.3 `s_atan.c` [F1]: reduction by the addition formula
 at 1/2, 1, 3/2 and infinity, then an odd polynomial in two halves.
 
 ### 2.2 Automatic differentiation
@@ -221,8 +217,8 @@ JavaScript and Rust and must give identical observation lines
 
 ## 4. Open questions
 
-- Correct rounding: when a CORE-MATH port lands as `math.*`, `ml.ad`
-  should switch to it (F9), which changes bits once.
+- Correct rounding for `expm1`, `log1p`, `tanh` and `atan`: when the
+  `math` module gains them, `ml.ad` should switch (bits change once).
 - A wgpu backend that offers binary64 lanes would enter through the
   `sum.f64` and `lanes.f64.*` classes unchanged.
 - Emitter limits (writes back in conditional positions, a loop variable
@@ -233,9 +229,7 @@ JavaScript and Rust and must give identical observation lines
 
 Only sources read in full are cited.
 
-- [F1] fdlibm 5.3, `k_sin.c`, Sun Microsystems 1993 (netlib.org/fdlibm).
-- [F2] fdlibm 5.3, `k_cos.c`, Sun Microsystems 1993 (netlib.org/fdlibm).
-- [F3] fdlibm 5.3, `s_atan.c`, Sun Microsystems 1993 (netlib.org/fdlibm).
+- [F1] fdlibm 5.3, `s_atan.c`, Sun Microsystems 1993 (netlib.org/fdlibm).
 - [R1] RCE specification, the 6.3 paragraphs F6 (signed zero) and F9
   (transcendentals),
   openIE-dev/rce `spec/RCE-SPEC.md` at b497ce3.
@@ -250,8 +244,7 @@ Only sources read in full are cited.
   reference posterior draw files of the four posteriors named in
   section 3 (the correlated Gaussian has an analytic reference).
 
-Methods named above by their usual names (Payne and Hanek reduction,
-Dekker's product, Wengert lists, HMC, NUTS, dual averaging, ADVI, split
+Methods named above by their usual names (Wengert lists, HMC, NUTS, dual averaging, ADVI, split
 R-hat, Geyer's sequence, Box-Muller, Welford's update, Stan's metric
 regularisation) are described here from their definitions as
 implemented; the papers that introduced them are not cited because they
