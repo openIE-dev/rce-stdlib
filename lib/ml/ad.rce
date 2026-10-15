@@ -156,7 +156,7 @@ pub fn atan(x0: f64) -> f64
 
 # x^y for x > 0 as math.exp(y ln x) (faithful to the error of exp and ln, not
 # correctly rounded).
-pub fn pow(x: f64, y: f64) -> f64 = math.exp(y * ln(x))
+fn pow_el(x: f64, y: f64) -> f64 = math.exp(y * ln(x))
 
 # x^n for an integer n by repeated squaring (exact order fixed).
 pub fn powi(x: f64, n: i64) -> f64
@@ -340,7 +340,7 @@ pub fn tmin(t: &mut Tape, i: i64, j: i64) -> i64
     return push(t, MIN, i, j, 0, v)
 # x^z for x > 0.
 pub fn tpow(t: &mut Tape, i: i64, j: i64) -> i64
-    let v = pow(t.val[i as usize], t.val[j as usize])
+    let v = pow_el(t.val[i as usize], t.val[j as usize])
     return push(t, POW, i, j, 0, v)
 pub fn tatan(t: &mut Tape, i: i64) -> i64
     let v = atan(t.val[i as usize])
