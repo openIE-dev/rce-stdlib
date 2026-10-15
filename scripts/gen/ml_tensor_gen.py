@@ -89,7 +89,7 @@ for idx in range(6):
     out.append(f'check net2_fd({LI([B,i,h,o])}, {L(xs)}, {L(ys)}, {L(p)}, {rnd.randrange(len(p))})')
 # training
 for idx,(sh,a,lossk,xs,ys,p) in enumerate(nets[:8]):
-    B,i,h,o=sh; opt=idx%2; lr=0.1 if opt==0 else 0.01; mom=0.9 if opt==0 else 0.0; wd=[0.0,1e-3][(idx//2)%2]; steps=12
+    B,i,h,o=sh; opt=idx%2; lr=0.1 if opt==0 else 0.01; mom=0.9 if opt==0 else 0.0; wd=[0.0,1e-3][(idx//2)%2]; steps=6  # 6 steps: one comptime fuel budget per check with the CR exp
     x=torch.tensor(xs).reshape(B,i); y=torch.tensor([int(v) for v in ys]) if lossk==0 else torch.tensor(ys).reshape(B,o)
     ps=tnet(sh,a,lossk,xs,ys,p)
     O=torch.optim.SGD(ps,lr=lr,momentum=mom,weight_decay=wd) if opt==0 else torch.optim.Adam(ps,lr=lr,betas=(0.9,0.999),eps=1e-8,weight_decay=wd)
