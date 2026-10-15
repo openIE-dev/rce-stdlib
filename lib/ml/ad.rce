@@ -1,12 +1,14 @@
 module ml.ad
+# uses: math.math
+use math
 
 # Automatic differentiation (ml.ad, spec/proposals/ml.md). Pure RCE on
 # f64, which is IEEE 754 binary64 with round to nearest even and no
 # contraction (6.3 N3): every `a * b + c` is two roundings on every target.
-# The elementary functions that RCE does not provide (exp, ln, log1p,
-# expm1, tanh, sigmoid, sin, cos) are written here with a fixed operation
-# order, so their bits are the same wherever + - * / and sqrt are
-# correctly rounded. They follow fdlibm 5.3 (Sun, 1993) kernels.
+# exp, ln, sin and cos are the correctly rounded functions of the math
+# module; log1p, expm1, tanh, sigmoid, softplus, atan and pow are built
+# here from them with a fixed operation order (atan follows the fdlibm
+# 5.3 kernel), so their bits are the same on every target.
 #
 # Two modes over one Wengert list (Griewank and Walther, Evaluating
 # Derivatives, 2nd ed., ch. 3):
@@ -23,106 +25,40 @@ pub const LN2_LO: f64 = 1.9082149292705877e-10
 pub const INV_LN2: f64 = 1.4426950408889634
 pub const PI: f64 = 3.141592653589793
 
-const P1: f64 = 0.16666666666666602
-const P2: f64 = -0.0027777777777015593
-const P3: f64 = 6.613756321437934e-05
-const P4: f64 = -1.6533902205465252e-06
-const P5: f64 = 4.1381367970572385e-08
 
-const LG1: f64 = 0.6666666666666735
-const LG2: f64 = 0.3999999999940942
-const LG3: f64 = 0.2857142874366239
-const LG4: f64 = 0.22222198432149784
-const LG5: f64 = 0.1818357216161805
-const LG6: f64 = 0.15313837699209373
-const LG7: f64 = 0.14798198605116586
-const SQRT2: f64 = 1.4142135623730951
-
-# 2^k, exact for -1074 <= k <= 1023 (products of powers of two).
-pub fn pow2(k: i64) -> f64
-    var r = 1.0
-    var n = k
-    var b = 2.0
-    if n < 0
-        n = 0 - n
-        b = 0.5
-    var sq = b
-    while n > 0 bound 64
-        if n % 2 == 1
-            r = r * sq
-        n = n / 2
-        if n > 0
-            sq = sq * sq
-    return r
 
 # x * 2^k without an intermediate overflow or a double rounding above the
 # subnormal range (split in two steps when k is large).
 pub fn ldexp(x: f64, k: i64) -> f64
     if k > 1000
-        return x * pow2(1000) * pow2(k - 1000)
+        return x * math.pow2(1000) * math.pow2(k - 1000)
     if k < -1000
-        return x * pow2(-1000) * pow2(k + 1000)
-    return x * pow2(k)
+        return x * math.pow2(-1000) * math.pow2(k + 1000)
+    return x * math.pow2(k)
 
 # The exponent e with 2^e <= |x| < 2^(e+1), x != 0 (exact comparisons).
 pub fn ilogb(x: f64) -> i64
     var a = x.abs()
     var e = 0
-    if a < pow2(-1000)
-        a = a * pow2(1000)
+    if a < math.pow2(-1000)
+        a = a * math.pow2(1000)
         e = -1000
     for s in [512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
-        if a >= pow2(s)
-            a = a * pow2(0 - s)
+        if a >= math.pow2(s)
+            a = a * math.pow2(0 - s)
             e += s
     for s in [512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
-        if a < pow2(1 - s)
-            a = a * pow2(s)
+        if a < math.pow2(1 - s)
+            a = a * math.pow2(s)
             e -= s
     return e
 
-# exp: fdlibm e_exp.c (k = round(x / ln 2), Remez polynomial on
-# |r| <= ln2/2). Below -745.14 the result is 0; above 709.78 it traps.
-pub fn exp(x: f64) -> f64
-    if x == 0.0
-        return 1.0
-    if x < -745.1332191019412
-        return 0.0
-    let half = if x < 0.0 then -0.5 else 0.5
-    let k = (x * INV_LN2 + half) as i64
-    let kf = k as f64
-    let hi = x - kf * LN2_HI
-    let lo = kf * LN2_LO
-    let r = hi - lo
-    let t = r * r
-    let c = r - t * (P1 + t * (P2 + t * (P3 + t * (P4 + t * P5))))
-    let y = 1.0 - ((lo - (r * c) / (2.0 - c)) - hi)
-    return ldexp(y, k)
-
-# ln: fdlibm e_log.c (x = 2^k (1+f), sqrt(2)/2 <= 1+f < sqrt(2)).
-pub fn ln(x: f64) -> f64
-    if x <= 0.0
-        return 0.0 / 0.0
-    if x == 1.0
-        return 0.0
-    var k = ilogb(x)
-    var m = ldexp(x, 0 - k)
-    if m >= SQRT2
-        m = m * 0.5
-        k += 1
-    let f = m - 1.0
-    let dk = k as f64
-    let s = f / (2.0 + f)
-    let z = s * s
-    let w = z * z
-    let t1 = w * (LG2 + w * (LG4 + w * LG6))
-    let t2 = z * (LG1 + w * (LG3 + w * (LG5 + w * LG7)))
-    let rr = t2 + t1
-    let hfsq = 0.5 * f * f
-    return dk * LN2_HI - ((hfsq - (s * (hfsq + rr) + dk * LN2_LO)) - f)
+# ln is math.log, correctly rounded (lib/math/math.rce, after CORE-MATH);
+# exp, sin and cos are used from math directly.
+pub fn ln(x: f64) -> f64 = math.log(x)
 
 # expm1: Horner Taylor series on |x| < 0.35 (18 terms, truncation below
-# 2^-60 relative), exp(x) - 1 elsewhere.
+# 2^-60 relative), math.exp(x) - 1 elsewhere.
 pub fn expm1(x: f64) -> f64
     if x.abs() < 0.35
         var p = 1.0
@@ -131,7 +67,7 @@ pub fn expm1(x: f64) -> f64
             p = 1.0 + x * p / (n as f64)
             n -= 1
         return x * p
-    return exp(x) - 1.0
+    return math.exp(x) - 1.0
 
 # log1p: Goldberg's correction (What Every Computer Scientist Should Know
 # About Floating-Point Arithmetic, Thm 4): u = 1 + x rounded, and
@@ -152,196 +88,19 @@ pub fn tanh(x: f64) -> f64
 
 pub fn sigmoid(x: f64) -> f64
     if x >= 0.0
-        return 1.0 / (1.0 + exp(0.0 - x))
-    let e = exp(x)
+        return 1.0 / (1.0 + math.exp(0.0 - x))
+    let e = math.exp(x)
     return e / (1.0 + e)
 
-# log(1 + exp(x)) without overflow.
+# log(1 + math.exp(x)) without overflow.
 pub fn softplus(x: f64) -> f64
     if x > 36.0
-        return x + exp(0.0 - x)
+        return x + math.exp(0.0 - x)
     if x < -36.0
-        return exp(x)
+        return math.exp(x)
     if x > 0.0
-        return x + log1p(exp(0.0 - x))
-    return log1p(exp(x))
-
-const S1: f64 = -0.16666666666666632
-const S2: f64 = 0.00833333333332249
-const S3: f64 = -0.0001984126982985795
-const S4: f64 = 2.7557313707070068e-06
-const S5: f64 = -2.5050760253406863e-08
-const S6: f64 = 1.58969099521155e-10
-const C1: f64 = 0.0416666666666666
-const C2: f64 = -0.001388888888887411
-const C3: f64 = 2.480158728947673e-05
-const C4: f64 = -2.7557314351390663e-07
-const C5: f64 = 2.087572321298175e-09
-const C6: f64 = -1.1359647557788195e-11
-
-fn ksin(x: f64) -> f64
-    let z = x * x
-    let v = z * x
-    let r = S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)))
-    return x + v * (S1 + z * r)
-
-fn kcos(x: f64) -> f64 = kcos2(x, 0.0)
-
-# ---- Payne and Hanek reduction for every finite |x| >= pi/4
-
-const PIO2_H: f64 = 1.5707963267948966
-const PIO2_L: f64 = 6.123233995736766e-17
-const SPLIT: f64 = 134217729.0
-
-# 2/pi as 66 base-2^24 digits (1584 bits), most significant first.
-fn two_over_pi() -> List[i64] = [10680707, 7228996, 1387004, 2578385, 16069853, 12639074, 9804092, 4427841, 16666979, 11263675, 12935607, 2387514, 4345298, 14681673, 3074569, 13734428, 16653803, 1880361, 10960616, 8533493, 3062596, 8710556, 7349940, 6258241, 3772886, 3769171, 3798172, 8675211, 12450088, 3874808, 9961438, 366607, 15675153, 9132554, 7151469, 3571407, 2607881, 12013382, 4155038, 6285869, 7677882, 13102053, 15825725, 473591, 9065106, 15363067, 6271263, 9264392, 5636912, 4652155, 7056368, 13614112, 10155062, 1944035, 9527646, 15080200, 6658437, 6231200, 6832269, 16767104, 5075751, 3212806, 1398474, 7579849, 6349435, 12618859]
-
-# a * b as an unevaluated sum p + e, exactly (Dekker; no FMA).
-fn two_prod(a: f64, b: f64) -> (f64, f64)
-    let p = a * b
-    let ta = SPLIT * a
-    let ah = ta - (ta - a)
-    let al = a - ah
-    let tb = SPLIT * b
-    let bh = tb - (tb - b)
-    let bl = b - bh
-    let e = ((ah * bh - p) + ah * bl + al * bh) + al * bl
-    return (p, e)
-
-# fdlibm 5.3 __kernel_sin(x, y, 1) and __kernel_cos(x, y) (k_sin.c,
-# k_cos.c): x + y is the reduced argument as a double-double.
-fn ksin2(x: f64, y: f64) -> f64
-    let z = x * x
-    let v = z * x
-    let r = S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)))
-    return x - ((z * (0.5 * y - v * r) - y) - v * S1)
-
-fn kcos2(x: f64, y: f64) -> f64
-    let z = x * x
-    let r = z * (C1 + z * (C2 + z * (C3 + z * (C4 + z * (C5 + z * C6)))))
-    let a = x.abs()
-    if a < 0.2999999523162842
-        return 1.0 - (0.5 * z - (z * r - x * y))
-    var qx = 0.28125
-    if a < 0.7812504768371582
-        # |x| / 4 with the low 32 bits of its significand cleared
-        let q = 0.25 * a
-        let e = ilogb(q)
-        qx = ldexp((ldexp(q, 20 - e)).floor(), e - 20)
-    let hz = 0.5 * z - qx
-    let w = 1.0 - qx
-    return w - (hz - (z * r - x * y))
-
-# x = n pi/2 + (y0 + y1), |y0 + y1| <= pi/4, returning (n mod 4, y0, y1).
-# x = m 2^s with m < 2^53 an integer. Digits of 2/pi whose products with
-# m are multiples of 4 are skipped; the next 10 digits give the integer
-# part mod 4 and at least 160 fraction bits, computed exactly in 24-bit
-# limbs; the fraction is rounded to the nearest integer, and its leading
-# 120 bits (after any cancellation) times pi/2 are formed in
-# double-double. Worst cases of Kahan and McDonald (x = 6381956970095103
-# 2^797) are among the checks.
-pub fn ph_reduce(x: f64) -> (i64, f64, f64)
-    let tp = two_over_pi()
-    let a = x.abs()
-    let e = ilogb(a)
-    let m = ldexp(a, 52 - e) as i64
-    let ms = [m >> 48, (m >> 24) & 16777215, m & 16777215]
-    let s = e - 52
-    let j0 = if s >= 2 then (s - 2) / 24 else 0
-    var d: List[i64] = []
-    for _ in 0..13
-        d.push(0)
-    for j in 0..10
-        for k in 0..3
-            let at = (j + k + 1) as usize
-            d[at] = d[at] + tp[(j0 + j) as usize] * ms[k as usize]
-    var i = 12
-    while i > 0 bound 13
-        let iu = i as usize
-        d[iu - 1] = d[iu - 1] + (d[iu] >> 24)
-        d[iu] = d[iu] & 16777215
-        i -= 1
-    let f = 24 * (j0 + 10) - s
-    let r = (24 - f % 24) % 24
-    if r > 0
-        var sh: List[i64] = [0]
-        for v in d
-            sh.push(v)
-        for q in 0..(sh.len() - 1)
-            sh[q] = ((sh[q] << r) & 16777215) | (sh[q + 1] >> (24 - r))
-        let last = sh.len() - 1
-        sh[last] = (sh[last] << r) & 16777215
-        d = sh
-    let nf = ((f + r) / 24) as usize
-    let start = d.len() - nf
-    var fr: List[i64] = []
-    for q in start..d.len()
-        fr.push(d[q])
-    var n = d[start - 1] & 3
-    var flip = false
-    if fr[0] >= 8388608
-        n = (n + 1) & 3
-        flip = true
-        var b = 0
-        var q = fr.len()
-        while q > 0 bound 64
-            q -= 1
-            let v = 0 - fr[q] - b
-            b = if v < 0 then 1 else 0
-            fr[q] = v + (b << 24)
-    var z: usize = 0
-    while fr[z] == 0 bound 64
-        z += 1
-    for _ in 0..5
-        fr.push(0)
-    let zi = z as i64
-    let ah = ldexp((fr[z] * 16777216 + fr[z + 1]) as f64, -24 * (zi + 2))
-    let bh = ldexp((fr[z + 2] * 16777216 + fr[z + 3]) as f64, -24 * (zi + 4))
-    let ch = ldexp(fr[z + 4] as f64, -24 * (zi + 5))
-    let fh = ah + bh
-    let fl = (bh - (fh - ah)) + ch
-    let (p, pe0) = two_prod(fh, PIO2_H)
-    let pe = pe0 + (fh * PIO2_L + fl * PIO2_H)
-    var y0 = p + pe
-    var y1 = pe - (y0 - p)
-    if flip
-        y0 = 0.0 - y0
-        y1 = 0.0 - y1
-    if x < 0.0
-        n = (4 - n) & 3
-        y0 = 0.0 - y0
-        y1 = 0.0 - y1
-    return (n, y0, y1)
-
-fn sin_big(x: f64) -> f64
-    let (n, y0, y1) = ph_reduce(x)
-    if n == 0
-        return ksin2(y0, y1)
-    if n == 1
-        return kcos2(y0, y1)
-    if n == 2
-        return 0.0 - ksin2(y0, y1)
-    return 0.0 - kcos2(y0, y1)
-
-fn cos_big(x: f64) -> f64
-    let (n, y0, y1) = ph_reduce(x)
-    if n == 0
-        return kcos2(y0, y1)
-    if n == 1
-        return 0.0 - ksin2(y0, y1)
-    if n == 2
-        return 0.0 - kcos2(y0, y1)
-    return ksin2(y0, y1)
-
-pub fn sin(x: f64) -> f64
-    if x.abs() < 0.7853981633974483
-        return ksin(x)
-    return sin_big(x)
-
-pub fn cos(x: f64) -> f64
-    if x.abs() < 0.7853981633974483
-        return kcos(x)
-    return cos_big(x)
+        return x + log1p(math.exp(0.0 - x))
+    return log1p(math.exp(x))
 
 # atan (fdlibm 5.3 s_atan.c): reduction to |x| < 7/16 by the identities
 # of atan(1/2), atan(1), atan(3/2) and pi/2, then an odd polynomial.
@@ -395,9 +154,9 @@ pub fn atan(x0: f64) -> f64
     let r = atan_hi(id) - ((x * (s1 + s2) - atan_lo(id)) - x)
     return if x0 < 0.0 then 0.0 - r else r
 
-# x^y for x > 0 as exp(y ln x) (faithful to the error of exp and ln, not
+# x^y for x > 0 as math.exp(y ln x) (faithful to the error of exp and ln, not
 # correctly rounded).
-pub fn pow(x: f64, y: f64) -> f64 = exp(y * ln(x))
+pub fn pow(x: f64, y: f64) -> f64 = math.exp(y * ln(x))
 
 # x^n for an integer n by repeated squaring (exact order fixed).
 pub fn powi(x: f64, n: i64) -> f64
@@ -428,7 +187,7 @@ pub fn ddiv(a: Dual, b: Dual) -> Dual
     return Dual(v: q, d: (a.d - q * b.d) / b.v)
 pub fn dneg(a: Dual) -> Dual = Dual(v: 0.0 - a.v, d: 0.0 - a.d)
 pub fn dexp(a: Dual) -> Dual
-    let e = exp(a.v)
+    let e = math.exp(a.v)
     return Dual(v: e, d: e * a.d)
 pub fn dln(a: Dual) -> Dual = Dual(v: ln(a.v), d: a.d / a.v)
 pub fn dsqrt(a: Dual) -> Dual
@@ -440,8 +199,8 @@ pub fn dtanh(a: Dual) -> Dual
 pub fn dsigmoid(a: Dual) -> Dual
     let s = sigmoid(a.v)
     return Dual(v: s, d: s * (1.0 - s) * a.d)
-pub fn dsin(a: Dual) -> Dual = Dual(v: sin(a.v), d: cos(a.v) * a.d)
-pub fn dcos(a: Dual) -> Dual = Dual(v: cos(a.v), d: 0.0 - sin(a.v) * a.d)
+pub fn dsin(a: Dual) -> Dual = Dual(v: math.sin(a.v), d: math.cos(a.v) * a.d)
+pub fn dcos(a: Dual) -> Dual = Dual(v: math.cos(a.v), d: 0.0 - math.sin(a.v) * a.d)
 pub fn dpowi(a: Dual, n: i64) -> Dual = Dual(v: powi(a.v, n), d: (n as f64) * powi(a.v, n - 1) * a.d)
 
 # ---------------------------------------------------------------- tape
@@ -523,7 +282,7 @@ pub fn neg(t: &mut Tape, i: i64) -> i64
     let v = 0.0 - t.val[i as usize]
     return push(t, NEG, i, -1, 0, v)
 pub fn texp(t: &mut Tape, i: i64) -> i64
-    let v = exp(t.val[i as usize])
+    let v = math.exp(t.val[i as usize])
     return push(t, EXP, i, -1, 0, v)
 pub fn tln(t: &mut Tape, i: i64) -> i64
     let v = ln(t.val[i as usize])
@@ -538,10 +297,10 @@ pub fn tsigmoid(t: &mut Tape, i: i64) -> i64
     let v = sigmoid(t.val[i as usize])
     return push(t, SIGMOID, i, -1, 0, v)
 pub fn tsin(t: &mut Tape, i: i64) -> i64
-    let v = sin(t.val[i as usize])
+    let v = math.sin(t.val[i as usize])
     return push(t, SIN, i, -1, 0, v)
 pub fn tcos(t: &mut Tape, i: i64) -> i64
-    let v = cos(t.val[i as usize])
+    let v = math.cos(t.val[i as usize])
     return push(t, COS, i, -1, 0, v)
 pub fn tpowi(t: &mut Tape, i: i64, n: i64) -> i64
     let v = powi(t.val[i as usize], n)
@@ -624,9 +383,9 @@ fn partials(t: &Tape, i: usize) -> (f64, f64)
     if o == SIGMOID
         return (y * (1.0 - y), 0.0)
     if o == SIN
-        return (cos(x), 0.0)
+        return (math.cos(x), 0.0)
     if o == COS
-        return (0.0 - sin(x), 0.0)
+        return (0.0 - math.sin(x), 0.0)
     if o == POWI
         return ((t.k[i] as f64) * powi(x, t.k[i] - 1), 0.0)
     if o == RELU

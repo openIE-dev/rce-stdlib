@@ -1,5 +1,6 @@
 module ml.prob
-# uses: ml.ad, rand.det
+# uses: math.math, ml.ad, rand.det
+use math
 use ml.ad
 use rand.det
 
@@ -60,13 +61,13 @@ pub fn rng(seed: &[i64], stream: i64) -> det.Rng
 pub fn uniform(r: &mut det.Rng) -> f64
     let a = det.next_u32(r) >> 5
     let b = det.next_u32(r) >> 6
-    return ((a as f64) * 67108864.0 + (b as f64) + 0.5) * ad.pow2(-53)
+    return ((a as f64) * 67108864.0 + (b as f64) + 0.5) * math.pow2(-53)
 
 # A standard normal by Box-Muller (one value per pair of uniforms).
 pub fn normal(r: &mut det.Rng) -> f64
     let u1 = uniform(r)
     let u2 = uniform(r)
-    return (-2.0 * ad.ln(u1)).sqrt() * ad.cos(6.283185307179586 * u2)
+    return (-2.0 * ad.ln(u1)).sqrt() * math.cos(6.283185307179586 * u2)
 
 # ---------------------------------------------------------------- density
 
@@ -214,11 +215,11 @@ fn da_step(d: &mut DualAvg, accept: f64, delta: f64) -> f64
     let w = 1.0 / (n + 10.0)
     d.hbar = (1.0 - w) * d.hbar + w * (delta - accept)
     let lx = d.mu - (n.sqrt() / 0.05) * d.hbar
-    let eta = ad.exp(-0.75 * ad.ln(n))
+    let eta = math.exp(-0.75 * ad.ln(n))
     d.lxbar = eta * lx + (1.0 - eta) * d.lxbar
-    return ad.exp(lx)
+    return math.exp(lx)
 
-fn da_final(d: &DualAvg) -> f64 = ad.exp(d.lxbar)
+fn da_final(d: &DualAvg) -> f64 = math.exp(d.lxbar)
 
 fn finite_ok(x: f64) -> bool = x > -1.0e300 and x < 1.0e300
 
@@ -241,7 +242,7 @@ fn hmc_step(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), r: &m
             break
     let e1 = energy(lp1, &p, mt)
     let h1 = if dv then h0 + 1000.0 else e1
-    let a = if h0 - h1 >= 0.0 then 1.0 else ad.exp(h0 - h1)
+    let a = if h0 - h1 >= 0.0 then 1.0 else math.exp(h0 - h1)
     let u = uniform(r)
     if not dv and u < a
         return (q1, lp1, g1, a, false)
@@ -273,8 +274,8 @@ fn empty_tree() -> Tree = Tree(ql: [], pl: [], gl: [], qr: [], pr: [], gr: [], q
 
 fn log_add(a: f64, b: f64) -> f64
     if a > b
-        return a + ad.log1p(ad.exp(b - a))
-    return b + ad.log1p(ad.exp(a - b))
+        return a + ad.log1p(math.exp(b - a))
+    return b + ad.log1p(math.exp(a - b))
 
 fn vadd(a: &[f64], b: &[f64]) -> List[f64]
     var r: List[f64] = []
@@ -307,7 +308,7 @@ fn build(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), r: &mut 
         let lp1 = leapfrog(m, lpf, &mut q1, &mut p1, &mut g1, dir * eps, mt)
         let h = energy(lp1, &p1, mt)
         let dv = h - h0 > 1000.0
-        let acc = if h0 - h >= 0.0 then 1.0 else ad.exp(h0 - h)
+        let acc = if h0 - h >= 0.0 then 1.0 else math.exp(h0 - h)
         return Tree(ql: copy(q1), pl: copy(p1), gl: copy(g1), qr: copy(q1), pr: copy(p1), gr: copy(g1), qp: copy(q1), lpp: lp1, gp: copy(g1), lw: h0 - h, rho: copy(p1), stop: dv, dv: dv, asum: if dv then 0.0 else acc, n: 1)
     let t1 = build(m, lpf, r, q, p, g, dir, depth - 1, eps, h0, mt)
     if t1.stop
@@ -334,7 +335,7 @@ fn build(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), r: &mut 
     let lw = log_add(t1.lw, t2.lw)
     # multinomial: take the second subtree's proposal with probability w2 / (w1 + w2)
     let um = uniform(r)
-    if um < ad.exp(t2.lw - lw)
+    if um < math.exp(t2.lw - lw)
         t.qp = copy(t2.qp)
         t.lpp = t2.lpp
         t.gp = copy(t2.gp)
@@ -385,7 +386,7 @@ fn nuts_step(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), r: &
         # biased progressive sampling: move to the new subtree with
         # probability min(1, w_new / w_old)
         let us = uniform(r)
-        if t.lw - lw >= 0.0 or us < ad.exp(t.lw - lw)
+        if t.lw - lw >= 0.0 or us < math.exp(t.lw - lw)
             qs = copy(t.qp)
             lps = t.lpp
             gs = copy(t.gp)

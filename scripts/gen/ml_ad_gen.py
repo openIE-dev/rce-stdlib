@@ -209,7 +209,7 @@ def main(root):
             assert e<1.0,(nm,x,e)
         el.append(f'# {nm}, large |x| (Payne and Hanek)\ncheck elem_bits({list(fx).index(nm)}, {L(big)}, {L(ys)})')
     print('sin/cos large-argument max ulp',bigw)
-    ad_ext = ['check dual_matches_tape()', 'check trelu_zero()', 'check ties()', 'check pow2(-1074) == 5e-324', 'check pow2(1023) == 8.98846567431158e+307',
+    ad_ext = ['check dual_matches_tape()', 'check trelu_zero()', 'check ties()', 'check math.pow2(-1074) == 5e-324', 'check math.pow2(1023) == 8.98846567431158e+307',
               'check ilogb(5e-324) == -1074', 'check ilogb(1.7976931348623157e+308) == 1023', 'check ilogb(1.0) == 0', 'check ilogb(0.75) == -1']
     files={}
     files['tests/ml/ad_checks.rce']=body+'\n'+'\n'.join(el+ad_ext)+'\n'

@@ -1,5 +1,6 @@
 module ml.tensor
-# uses: ml.ad
+# uses: math.math, ml.ad
+use math
 use ml.ad
 
 # Deterministic tensors, layers and optimizers (ml.tensor,
@@ -127,7 +128,7 @@ fn un(f: i64, x: f64) -> f64
     if f == 2
         return ad.sigmoid(x)
     if f == 3
-        return ad.exp(x)
+        return math.exp(x)
     return ad.softplus(x)
 
 pub fn map(a: &Tensor, f: i64) -> Tensor
@@ -212,7 +213,7 @@ pub fn log_softmax(z: &Tensor, tree: i64) -> Tensor
             mx = mx.max(z.data[(i * c + j) as usize])
         e = []
         for j in 0..c
-            e.push(ad.exp(z.data[(i * c + j) as usize] - mx))
+            e.push(math.exp(z.data[(i * c + j) as usize] - mx))
         let lse = ad.ln(reduce(&e, tree))
         for j in 0..c
             d.push((z.data[(i * c + j) as usize] - mx) - lse)
@@ -558,8 +559,8 @@ pub fn f32_bits(x: f32) -> i64
     let e = ad.ilogb(a)
     if e < -126
         return sg | (ad.ldexp(a, 149) as i64)
-    let mant = (ad.ldexp(a, 23 - e) as i64) - 8388608
-    return sg | ((e + 127) << 23) | mant
+    let mnt = (ad.ldexp(a, 23 - e) as i64) - 8388608
+    return sg | ((e + 127) << 23) | mnt
 
 # The binary64 bit pattern of a finite x, sign of zero included.
 pub fn f64_bits(x: f64) -> u64
@@ -570,8 +571,8 @@ pub fn f64_bits(x: f64) -> u64
     let e = ad.ilogb(a)
     if e < -1022
         return sg | (ad.ldexp(a, 1074) as u64)
-    let mant = (ad.ldexp(a, 52 - e) as u64) - 4503599627370496
-    return sg | (((e + 1023) as u64) << 52) | mant
+    let mnt = (ad.ldexp(a, 52 - e) as u64) - 4503599627370496
+    return sg | (((e + 1023) as u64) << 52) | mnt
 
 # Raw-bit equality: tells -0.0 from 0.0, unlike ==.
 pub fn same_bits(a: f64, b: f64) -> bool = f64_bits(a) == f64_bits(b)

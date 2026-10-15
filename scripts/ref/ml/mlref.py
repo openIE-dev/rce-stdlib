@@ -3,12 +3,6 @@ tape (same operation order; CPython floats are IEEE 754 binary64 with no
 contraction). Used by scripts/gen/ml_gen.py to emit bit-exact vectors."""
 import math
 LN2_HI=0.6931471803691238; LN2_LO=1.9082149292705877e-10; INV_LN2=1.4426950408889634
-P1=0.16666666666666602; P2=-0.0027777777777015593; P3=6.613756321437934e-05; P4=-1.6533902205465252e-06; P5=4.1381367970572385e-08
-LG1=0.6666666666666735; LG2=0.3999999999940942; LG3=0.2857142874366239; LG4=0.22222198432149784; LG5=0.1818357216161805; LG6=0.15313837699209373; LG7=0.14798198605116586
-SQRT2=1.4142135623730951
-S1=-0.16666666666666632; S2=0.00833333333332249; S3=-0.0001984126982985795; S4=2.7557313707070068e-06; S5=-2.5050760253406863e-08; S6=1.58969099521155e-10
-C1=0.0416666666666666; C2=-0.001388888888887411; C3=2.480158728947673e-05; C4=-2.7557314351390663e-07; C5=2.087572321298175e-09; C6=-1.1359647557788195e-11
-PIO2_1=1.5707963267341256; PIO2_2=6.077100506303966e-11; PIO2_2T=2.0222662487959506e-21; INV_PIO2=0.6366197723675814
 
 def pow2(k): return math.ldexp(1.0,k)
 def ldexp(x,k):
@@ -16,25 +10,30 @@ def ldexp(x,k):
     if k<-1000: return x*pow2(-1000)*pow2(k+1000)
     return x*pow2(k)
 def ilogb(x): return math.frexp(abs(x))[1]-1
-def trunc(x): return int(x)
-def exp(x):
-    if x==0.0: return 1.0
-    if x< -745.1332191019412: return 0.0
-    half=-0.5 if x<0 else 0.5
-    k=trunc(x*INV_LN2+half); kf=float(k)
-    hi=x-kf*LN2_HI; lo=kf*LN2_LO; r=hi-lo; t=r*r
-    c=r-t*(P1+t*(P2+t*(P3+t*(P4+t*P5))))
-    y=1.0-((lo-(r*c)/(2.0-c))-hi)
-    return ldexp(y,k)
+import mpmath
+mpmath.mp.prec=400
+def _cr(v):
+    """The binary64 nearest to the mpf v, ties to even (subnormals included)."""
+    if v==0: return 0.0
+    a=abs(v); e=int(mpmath.floor(mpmath.log(a,2)))
+    q=max(e,-1022)-52
+    m=a*mpmath.mpf(2)**(-q); n=int(mpmath.floor(m)); fr=m-n
+    if fr>0.5 or (fr==0.5 and n%2==1): n+=1
+    r=math.ldexp(float(n),q)
+    return r if v>0 else -r
+# exp, ln, sin, cos: correctly rounded (as lib/math/math.rce), from
+# mpmath at 400 bits; no tested argument is near a hard case at that
+# precision (CORE-MATH's worst cases need fewer than 160 bits).
+def exp(x): return _cr(mpmath.exp(mpmath.mpf(x)))
 def ln(x):
     assert x>0
-    if x==1.0: return 0.0
-    k=ilogb(x); m=ldexp(x,-k)
-    if m>=SQRT2: m=m*0.5; k+=1
-    f=m-1.0; dk=float(k); s=f/(2.0+f); z=s*s; w=z*z
-    t1=w*(LG2+w*(LG4+w*LG6)); t2=z*(LG1+w*(LG3+w*(LG5+w*LG7))); rr=t2+t1
-    hfsq=0.5*f*f
-    return dk*LN2_HI-((hfsq-(s*(hfsq+rr)+dk*LN2_LO))-f)
+    return _cr(mpmath.log(mpmath.mpf(x)))
+def _trig(f,x):
+    # the reduction needs about log2|x| more bits than the result
+    with mpmath.workprec(400+max(0,math.frexp(x)[1])):
+        return _cr(f(mpmath.mpf(x)))
+def sin(x): return _trig(mpmath.sin,x)
+def cos(x): return _trig(mpmath.cos,x)
 def expm1(x):
     if abs(x)<0.35:
         p=1.0
@@ -58,74 +57,6 @@ def softplus(x):
     if x< -36.0: return exp(x)
     if x>0.0: return x+log1p(exp(0.0-x))
     return log1p(exp(x))
-def ksin(x):
-    z=x*x; v=z*x; r=S2+z*(S3+z*(S4+z*(S5+z*S6))); return x+v*(S1+z*r)
-def kcos(x): return kcos2(x,0.0)
-def reduce(x):
-    assert abs(x)<1647099.0
-    half=-0.5 if x<0 else 0.5
-    n=trunc(x*INV_PIO2+half); f=float(n)
-    return n,((x-f*PIO2_1)-f*PIO2_2)-f*PIO2_2T
-
-# Payne and Hanek reduction, digit for digit as lib/ml/ad.rce ph_reduce.
-TWO_OVER_PI=[10680707, 7228996, 1387004, 2578385, 16069853, 12639074, 9804092, 4427841, 16666979, 11263675, 12935607, 2387514, 4345298, 14681673, 3074569, 13734428, 16653803, 1880361, 10960616, 8533493, 3062596, 8710556, 7349940, 6258241, 3772886, 3769171, 3798172, 8675211, 12450088, 3874808, 9961438, 366607, 15675153, 9132554, 7151469, 3571407, 2607881, 12013382, 4155038, 6285869, 7677882, 13102053, 15825725, 473591, 9065106, 15363067, 6271263, 9264392, 5636912, 4652155, 7056368, 13614112, 10155062, 1944035, 9527646, 15080200, 6658437, 6231200, 6832269, 16767104, 5075751, 3212806, 1398474, 7579849, 6349435, 12618859]
-PIO2_H=1.5707963267948966; PIO2_L=6.123233995736766e-17; SPLIT=134217729.0
-def two_prod(a,b):
-    p=a*b; t=SPLIT*a; ah=t-(t-a); al=a-ah; t=SPLIT*b; bh=t-(t-b); bl=b-bh
-    return p,((ah*bh-p)+ah*bl+al*bh)+al*bl
-def ksin2(x,y):
-    z=x*x; v=z*x; r=S2+z*(S3+z*(S4+z*(S5+z*S6)))
-    return x-((z*(0.5*y-v*r)-y)-v*S1)
-def kcos2(x,y):
-    # fdlibm 5.3 k_cos.c
-    z=x*x; r=z*(C1+z*(C2+z*(C3+z*(C4+z*(C5+z*C6))))); a=abs(x)
-    if a<0.2999999523162842: return 1.0-(0.5*z-(z*r-x*y))
-    qx=0.28125
-    if a<0.7812504768371582:
-        q=0.25*a; e=ilogb(q); qx=ldexp(float(math.floor(ldexp(q,20-e))),e-20)
-    hz=0.5*z-qx; w=1.0-qx
-    return w-(hz-(z*r-x*y))
-def ph_reduce(x):
-    a=abs(x); e=ilogb(a); m=int(ldexp(a,52-e))
-    ms=[m>>48,(m>>24)&0xffffff,m&0xffffff]; s=e-52
-    j0=(s-2)//24 if s>=2 else 0
-    D=[0]*13
-    for j in range(10):
-        for k in range(3): D[j+k+1]+=TWO_OVER_PI[j0+j]*ms[k]
-    for i in range(12,0,-1):
-        D[i-1]+=D[i]>>24; D[i]&=0xffffff
-    F=24*(j0+10)-s; r=(24-F%24)%24
-    if r:
-        D=[0]+D
-        for i in range(len(D)-1): D[i]=((D[i]<<r)&0xffffff)|(D[i+1]>>(24-r))
-        D[-1]=(D[-1]<<r)&0xffffff
-    nf=(F+r)//24; st=len(D)-nf; fr=D[st:]; n=D[st-1]&3; neg=False
-    if fr[0]>=0x800000:
-        n=(n+1)&3; neg=True; b=0
-        for i in range(len(fr)-1,-1,-1):
-            v=0-fr[i]-b; b=1 if v<0 else 0; fr[i]=v+(b<<24)
-    z=0
-    while fr[z]==0: z+=1
-    fr=fr+[0]*5
-    A=ldexp(float(fr[z]*16777216+fr[z+1]),-24*(z+2)); B=ldexp(float(fr[z+2]*16777216+fr[z+3]),-24*(z+4)); Cc=ldexp(float(fr[z+4]),-24*(z+5))
-    fh=A+B; fl=(B-(fh-A))+Cc
-    p,pe=two_prod(fh,PIO2_H); pe=pe+(fh*PIO2_L+fl*PIO2_H)
-    y0=p+pe; y1=pe-(y0-p)
-    if neg: y0=0.0-y0; y1=0.0-y1
-    if x<0: n=(4-n)&3; y0=0.0-y0; y1=0.0-y1
-    return n,y0,y1
-def sin(x):
-    if abs(x)<0.7853981633974483: return ksin(x)
-    if True:
-        n,y0,y1=ph_reduce(x); return [ksin2(y0,y1),kcos2(y0,y1),0.0-ksin2(y0,y1),0.0-kcos2(y0,y1)][n]
-    n,y=reduce(x); q=n%4
-    return [ksin(y),kcos(y),0.0-ksin(y),0.0-kcos(y)][q]
-def cos(x):
-    if abs(x)<0.7853981633974483: return kcos(x)
-    if True:
-        n,y0,y1=ph_reduce(x); return [kcos2(y0,y1),0.0-ksin2(y0,y1),0.0-kcos2(y0,y1),ksin2(y0,y1)][n]
-    n,y=reduce(x); q=n%4
-    return [kcos(y),0.0-ksin(y),0.0-kcos(y),ksin(y)][q]
 def powi(x,n):
     r=1.0; m=abs(n); b=x
     while m>0:

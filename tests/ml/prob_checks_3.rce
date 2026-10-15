@@ -44,7 +44,7 @@ fn eight(t0: ad.Tape, x: &[i64], d: &[f64]) -> (ad.Tape, i64)
     return (t, r)
 
 fn eight_out(q: &[f64]) -> List[f64]
-    let tau = ad.exp(q[9])
+    let tau = math.exp(q[9])
     var o: List[f64] = []
     for i in 0..8
         o.push(q[i] * tau + q[8])
@@ -111,7 +111,7 @@ fn kid(t0: ad.Tape, x: &[i64], d: &[f64]) -> (ad.Tape, i64)
     let r = ad.sub(&mut t, a1, lc)
     return (t, r)
 
-fn kid_out(q: &[f64]) -> List[f64] = [q[0], q[1], ad.exp(q[2])]
+fn kid_out(q: &[f64]) -> List[f64] = [q[0], q[1], math.exp(q[2])]
 
 # blr: beta ~ normal(0, 10), sigma ~ normal+(0, 10), y ~ normal(X beta,
 # sigma). x = [beta[1..D], log sigma]. The residual sum of squares is
@@ -216,7 +216,7 @@ fn blr_out(q: &[f64]) -> List[f64]
     var o: List[f64] = []
     for j in 0..(q.len() - 1)
         o.push(q[j])
-    o.push(ad.exp(q[q.len() - 1]))
+    o.push(math.exp(q[q.len() - 1]))
     return o
 
 # A correlated Gaussian (analytic reference, for the dense metric): x ~

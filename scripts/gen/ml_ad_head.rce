@@ -167,7 +167,7 @@ fn ties() -> bool
 # n: 0 exp, 1 ln, 2 expm1, 3 log1p, 4 tanh, 5 sigmoid, 6 softplus, 7 sin, 8 cos, 9 atan
 fn elem(n: i64, x: f64) -> f64
     if n == 0
-        return exp(x)
+        return math.exp(x)
     if n == 1
         return ln(x)
     if n == 2
@@ -181,9 +181,9 @@ fn elem(n: i64, x: f64) -> f64
     if n == 6
         return softplus(x)
     if n == 7
-        return sin(x)
+        return math.sin(x)
     if n == 8
-        return cos(x)
+        return math.cos(x)
     return atan(x)
 
 fn elem_bits(n: i64, xs: List[f64], want: List[f64]) -> bool
