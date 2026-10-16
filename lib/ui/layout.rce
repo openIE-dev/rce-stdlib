@@ -1372,7 +1372,8 @@ fn container_main(t: &mut Tree, av: &List[Av], lines: &List[List[i64]], it: &mut
                     if diff > 0.0
                         it[i].cff = diff / fmax(1.0, it[i].grow)
                     elif diff < 0.0
-                        it[i].cff = diff / (fmax(1.0, it[i].shrink) * it[i].ibasis)
+                        let ssf0 = fmax(1.0, it[i].shrink) * it[i].ibasis
+                        it[i].cff = if ssf0 == 0.0 then -1.0e300 else diff / ssf0
                     else
                         it[i].cff = 0.0
                 for ii in ln
@@ -2744,8 +2745,8 @@ fn oof_box(t: &mut Tree, ch: i64, cd: &List[f64], aw: f64, ah: f64, offx: f64, o
     let y = oof_pos(ah, it, ib, &vm, &vrm, &vimc, vsa, vse, vedge, vsafe, val, als >= SAFE, false, fs[1], is_scroll_container(ovy)) + offy
     set_layout(t, ch, x, y, fs[0], fs[1], lo.orr, lo.ob)
     set_box(t, ch, &cbd, cs.ovx, cs.ovy, cs.sbw)
-    let cx = if rtl then ow - (x + fs[0]) - bor[R] else x - bor[L]
-    let oc = overflow_contrib(cx, y - bor[T], fs[0], fs[1], &lo, &cs, is_scroll_container(ovx) or is_scroll_container(ovy))
+    let cx = if rtl then aw - (x - offx) - fs[0] else x - offx
+    let oc = overflow_contrib(cx, y - offy, fs[0], fs[1], &lo, &cs, is_scroll_container(ovx) or is_scroll_container(ovy))
     return oc
 
 fn oof_layout(t: &mut Tree, n: i64, o: &mut Out) bound 4096
