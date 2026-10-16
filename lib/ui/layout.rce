@@ -2325,10 +2325,12 @@ fn oof_margins(m: &List[f64], is: f64, ie: f64, im: &List[f64], size: f64, inlin
     if free < 0.0 and inline
         return if rev then [free, 0.0] else [0.0, free]
     return [free / 2.0, free / 2.0]
-fn oof_pos(cb: f64, is: f64, ie: f64, m: &List[f64], rm: &List[f64], im: &List[f64], sa: f64, se: f64, edge: i64, al: i64, safe: bool, rev: bool, size: f64, scroll: bool) -> f64
+fn oof_pos(cb: f64, is: f64, ie: f64, m: &List[f64], rm: &List[f64], im: &List[f64], sa: f64, se: f64, edge: i64, ssafe: bool, al: i64, safe: bool, rev: bool, size: f64, scroll: bool) -> f64
     let mb = size + rm[0] + rm[1]
     let se_start = if rev then 1 else 0
     if not has(is) and not has(ie)
+        if ssafe and mb > im[1] - im[0]
+            return align_line(im[0], im[1], mb, se_start) + rm[0]
         return align_line(sa, se, mb, edge) + rm[0]
     if has(is) and not has(ie)
         return im[0] + rm[0]
@@ -2362,6 +2364,32 @@ fn oof_pos(cb: f64, is: f64, ie: f64, m: &List[f64], rm: &List[f64], im: &List[f
         else
             st = align_line(la, lb, mb, se_start)
     return st + rm[0]
+fn main_edge(k: i64, fr: bool, mrtl: bool) -> i64
+    if k == A_START
+        return if mrtl then 1 else 0
+    if k == A_END
+        return if mrtl then 0 else 1
+    if k == A_CENTER or k == A_SEVENLY or k == A_SAROUND
+        return 2
+    if k == A_LEFT
+        return 0
+    if k == A_RIGHT
+        return 1
+    if k == A_FEND
+        return if fr then 0 else 1
+    return if fr then 1 else 0
+fn cross_edge(k: i64, cr: bool, crtl: bool) -> i64
+    if k == A_START or k == A_BASE
+        return if crtl then 1 else 0
+    if k == A_END
+        return if crtl then 0 else 1
+    if k == A_CENTER
+        return 2
+    if k == A_FEND
+        return if cr then 0 else 1
+    if k == A_STRETCH or k == A_FSTART
+        return if cr then 1 else 0
+    return 0
 fn oof_align(a: i64) -> i64
     let k = akw(a)
     if k == A_NA
@@ -2388,15 +2416,55 @@ fn oof_layout(t: &mut Tree, n: i64, o: &mut Out) bound 4096
     for ch in copy(t.kids[n as usize])
         let cs = sty(t, ch)
         if is_oof(cs.position) and cs.display != D_NONE
-            # static position relative to the area
-            var sx = 0.0
-            var sy = 0.0
-            if s.display == D_BLOCK or s.display == D_FLOWROOT
-                sx = t.x[ch as usize] - ins[L]
-                sy = t.y[ch as usize] - ins[T]
+            # static position (area start, end, edge, safe) per axis, relative to the area
+            var hsa = 0.0
+            var hse = 0.0
+            var hedge = if s.rtl then 1 else 0
+            var hsafe = false
+            var vsa = 0.0
+            var vse = 0.0
+            var vedge = 0
+            var vsafe = false
+            if s.display == D_FLEX
+                let isrow = s.flex_dir < 2
+                let mrtl = isrow and s.rtl
+                let crtl = (not isrow) and s.rtl
+                let fr = (s.flex_dir == 1 or s.flex_dir == 3) != mrtl
+                let cr = (s.flex_wrap == 2) != crtl
+                let cbi = [ins[L] + pad[L], ins[R] + pad[R], ins[T] + pad[T], ins[B] + pad[B]]
+                let mk = main_edge(akw(s.justify_content), fr, mrtl)
+                var a0 = if akw(cs.align_self) != A_NA then cs.align_self else s.align_items
+                if akw(a0) == A_NA
+                    a0 = A_STRETCH
+                let asafe = a0 >= SAFE
+                var ak = akw(a0)
+                let flip = (not isrow) and cs.rtl != s.rtl
+                if ak == A_SSTART
+                    ak = if flip then A_END else A_START
+                elif ak == A_SEND
+                    ak = if flip then A_START else A_END
+                let ck = cross_edge(ak, cr, crtl)
+                let hx0 = cbi[L] - ins[L]
+                let hx1 = o.w - cbi[R] - ins[L]
+                let vy0 = cbi[T] - ins[T]
+                let vy1 = o.h - cbi[B] - ins[T]
+                hsa = hx0
+                hse = hx1
+                vsa = vy0
+                vse = vy1
+                if isrow
+                    hedge = mk
+                    vedge = ck
+                    vsafe = asafe
+                else
+                    vedge = mk
+                    hedge = ck
+                    hsafe = asafe
             else
-                sx = if s.rtl then aw - pad[R] else pad[L]
-                sy = pad[T]
+                hsa = t.x[ch as usize] - ins[L]
+                hse = hsa
+                vsa = t.y[ch as usize] - ins[T]
+                vse = vsa
             let m = rect_opt(&cs.margin, aw, aw)
             let cpd = rect0(&cs.padding, aw)
             let cbd = rect0(&cs.border, aw)
@@ -2427,9 +2495,8 @@ fn oof_layout(t: &mut Tree, n: i64, o: &mut Out) bound 4096
                 als = als - A_SEND + A_END
             let hal = oof_align(js)
             let val = oof_align(als)
-            let hedge = if s.rtl then 1 else 0
-            let himc = imcb(aw, il, ir, sx, sx, hedge, s.rtl)
-            let vimc = imcb(ah, it, ib, sy, sy, 0, false)
+            let himc = imcb(aw, il, ir, hsa, hse, hedge, s.rtl)
+            let vimc = imcb(ah, it, ib, vsa, vse, vedge, false)
             let sfw = fmax(himc[1] - himc[0] - orz(m[L]) - orz(m[R]), 0.0)
             let sfh = fmax(vimc[1] - vimc[0] - orz(m[T]) - orz(m[B]), 0.0)
             let avw = mclamp(sfw, mn[0], mx[0])
@@ -2473,8 +2540,8 @@ fn oof_layout(t: &mut Tree, n: i64, o: &mut Out) bound 4096
             let vm = [m[T], m[B]]
             let hrm = oof_margins(&hm, il, ir, &himc, fs[0], true, s.rtl)
             let vrm = oof_margins(&vm, it, ib, &vimc, fs[1], false, false)
-            let x = oof_pos(aw, il, ir, &hm, &hrm, &himc, sx, sx, hedge, hal, js >= SAFE, s.rtl, fs[0], is_scroll_container(s.ovx)) + ins[L]
-            let y = oof_pos(ah, it, ib, &vm, &vrm, &vimc, sy, sy, 0, val, als >= SAFE, false, fs[1], is_scroll_container(s.ovy)) + ins[T]
+            let x = oof_pos(aw, il, ir, &hm, &hrm, &himc, hsa, hse, hedge, hsafe, hal, js >= SAFE, s.rtl, fs[0], is_scroll_container(s.ovx)) + ins[L]
+            let y = oof_pos(ah, it, ib, &vm, &vrm, &vimc, vsa, vse, vedge, vsafe, val, als >= SAFE, false, fs[1], is_scroll_container(s.ovy)) + ins[T]
             set_layout(t, ch, x, y, fs[0], fs[1], lo.orr, lo.ob)
             set_box(t, ch, &cbd, cs.ovx, cs.ovy, cs.sbw)
             let cx = if s.rtl then o.w - (x + fs[0]) - bor[R] else x - bor[L]
