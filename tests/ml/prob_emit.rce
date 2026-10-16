@@ -72,8 +72,24 @@ fn suff2(y: &[f64], x: &[f64]) -> List[f64]
 
 # kidscore_momiq: kid_score ~ normal(b1 + b2 mom_iq, sigma), sigma ~
 # cauchy(0, 2.5). x = [b1, b2, log sigma]; data = suff2(kid_score, mom_iq).
+# Outside a box where every intermediate stays finite (exp(2 * 300) times
+# the data scale, coefficients to 1e6) a model returns a constant -1e300:
+# the energy error then exceeds 1000 and the sampler counts a divergence,
+# as Stan does when a log density throws. Emitted Rust traps on a
+# non-finite float, so the model must not reach one.
+fn outside(t: &ad.Tape, x: &[i64], ls: i64) -> bool
+    for i in 0..x.len()
+        let v = ad.value(t, x[i])
+        let lim = if i as i64 == ls then 300.0 else 1.0e6
+        if not (v > 0.0 - lim and v < lim)
+            return true
+    return false
+
 fn kid(t0: ad.Tape, x: &[i64], d: &[f64]) -> (ad.Tape, i64)
     var t = t0
+    if outside(&t, x, 2)
+        let rj = ad.constant(&mut t, -1.0e300)
+        return (t, rj)
     let b1 = x[0]
     let b2 = x[1]
     let v = x[2]
@@ -182,6 +198,9 @@ fn blr_stats(n: i64, dd: i64, xm: &[f64], y: &[f64]) -> List[f64]
 
 fn blr(t0: ad.Tape, x: &[i64], d: &[f64]) -> (ad.Tape, i64)
     var t = t0
+    if outside(&t, x, (x.len() as i64) - 1)
+        let rj = ad.constant(&mut t, -1.0e300)
+        return (t, rj)
     let n = d[0]
     let dd = d[1] as i64
     let v = x[dd as usize]
