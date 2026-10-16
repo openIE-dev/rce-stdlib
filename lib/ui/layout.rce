@@ -237,7 +237,7 @@ fn ov_kw(s: &text) -> i64
     return O_VIS
 
 fn style_default() -> Style
-    return Style(display: D_FLEX, rtl: false, position: P_REL, border_box: true, ovx: O_VIS, ovy: O_VIS, sbw: 0.0, float: 0, clear: 0, contain: "", vertical: false, text_align: "", size: [lauto(), lauto()], min: [lauto(), lauto()], max: [lauto(), lauto()], inset: [lauto(), lauto(), lauto(), lauto()], margin: [lzero(), lzero(), lzero(), lzero()], padding: [lzero(), lzero(), lzero(), lzero()], border: [lzero(), lzero(), lzero(), lzero()], gap: [lzero(), lzero()], ratio: NO, align_items: A_NA, align_self: A_NA, justify_items: A_NA, justify_self: A_NA, align_content: A_NA, justify_content: A_NA, flex_dir: 0, flex_wrap: 0, line_count: 1, grow: 0.0, shrink: 1.0, basis: lauto(), auto_flow: "", rows: "", cols: "", auto_rows: "", auto_cols: "", row_start: "", row_end: "", col_start: "", col_end: "")
+    return Style(display: D_FLEX, rtl: false, position: P_STATIC, border_box: true, ovx: O_VIS, ovy: O_VIS, sbw: 0.0, float: 0, clear: 0, contain: "", vertical: false, text_align: "", size: [lauto(), lauto()], min: [lauto(), lauto()], max: [lauto(), lauto()], inset: [lauto(), lauto(), lauto(), lauto()], margin: [lzero(), lzero(), lzero(), lzero()], padding: [lzero(), lzero(), lzero(), lzero()], border: [lzero(), lzero(), lzero(), lzero()], gap: [lzero(), lzero()], ratio: NO, align_items: A_NA, align_self: A_NA, justify_items: A_NA, justify_self: A_NA, align_content: A_NA, justify_content: A_NA, flex_dir: 0, flex_wrap: 0, line_count: 1, grow: 0.0, shrink: 1.0, basis: lauto(), auto_flow: "", rows: "", cols: "", auto_rows: "", auto_cols: "", row_start: "", row_end: "", col_start: "", col_end: "")
 
 # Rect sides are ordered left, right, top, bottom; sizes width, height.
 const L: usize = 0
@@ -1578,7 +1578,7 @@ fn align_stretch(cross: &mut List[f64], ks: &List[f64], c: &FC)
     var tot = gaps(c.gap[x], cross.len() as i64)
     for v in cross
         tot = tot + v
-    if tot < cmin
+    if tot < cmin and cross.len() > 0
         let add = (cmin - tot) / (cross.len() as f64)
         for k in 0..cross.len()
             cross[k] = cross[k] + add
@@ -2535,69 +2535,115 @@ fn oof_align(a: i64) -> i64
         return 4
     return 2
 
+
+fn box_ins(s: &Style, pw: f64) -> List[f64]
+    let rb = rect0(&s.border, pw)
+    let gx = if s.ovy == O_SCROLL then s.sbw else 0.0
+    let gy = if s.ovx == O_SCROLL then s.sbw else 0.0
+    return [rb[L] + (if s.rtl then gx else 0.0), rb[R] + (if s.rtl then 0.0 else gx), rb[T], rb[B] + gy]
+# static position of positioned child ch of p (p's border-box coordinates):
+# [hsa, hse, hedge, hsafe, vsa, vse, vedge, vsafe]
+fn static_pos(t: &Tree, p: i64, ch: i64, w: f64, h: f64) -> List[f64]
+    let s = sty(t, p)
+    let cs = sty(t, ch)
+    let pins = box_ins(&s, w)
+    let ppad = rect0(&s.padding, w)
+    # static position (area start, end, edge, safe) per axis, relative to the area
+    var hsa = 0.0
+    var hse = 0.0
+    var hedge = if s.rtl then 1 else 0
+    var hsafe = false
+    var vsa = 0.0
+    var vse = 0.0
+    var vedge = 0
+    var vsafe = false
+    if s.display == D_FLEX
+        let isrow = s.flex_dir < 2
+        let mrtl = isrow and s.rtl
+        let crtl = (not isrow) and s.rtl
+        let fr = (s.flex_dir == 1 or s.flex_dir == 3) != mrtl
+        let cr = (s.flex_wrap == 2 or s.flex_wrap == 4) != crtl
+        let cbi = [pins[L] + ppad[L], pins[R] + ppad[R], pins[T] + ppad[T], pins[B] + ppad[B]]
+        let mk = main_edge(akw(s.justify_content), fr, mrtl)
+        var a0 = if akw(cs.align_self) != A_NA then cs.align_self else s.align_items
+        if akw(a0) == A_NA
+            a0 = A_STRETCH
+        let asafe = a0 >= SAFE
+        var ak = akw(a0)
+        let flip = (not isrow) and cs.rtl != s.rtl
+        if ak == A_SSTART
+            ak = if flip then A_END else A_START
+        elif ak == A_SEND
+            ak = if flip then A_START else A_END
+        let ck = cross_edge(ak, cr, crtl)
+        let hx0 = cbi[L]
+        let hx1 = w - cbi[R]
+        let vy0 = cbi[T]
+        let vy1 = h - cbi[B]
+        hsa = hx0
+        hse = hx1
+        vsa = vy0
+        vse = vy1
+        if isrow
+            hedge = mk
+            vedge = ck
+            vsafe = asafe
+        else
+            vedge = mk
+            hedge = ck
+            hsafe = asafe
+    else
+        hsa = t.x[ch as usize]
+        hse = hsa
+        vsa = t.y[ch as usize]
+        vse = vsa
+    return [hsa, hse, hedge as f64, if hsafe then 1.0 else 0.0, vsa, vse, vedge as f64, if vsafe then 1.0 else 0.0]
+# collect positioned descendants claimed by the owner, through static boxes
+fn oof_collect(t: &Tree, p: i64, ox: f64, oy: f64, w: f64, h: f64, root: bool, out: &mut List[List[f64]]) bound 4096
+    for ch in copy(t.kids[p as usize])
+        let cs = sty(t, ch)
+        if cs.display != D_NONE
+            if is_oof(cs.position)
+                if root or cs.position == P_ABS
+                    var sp = static_pos(t, p, ch, w, h)
+                    sp[0] = sp[0] + ox
+                    sp[1] = sp[1] + ox
+                    sp[4] = sp[4] + oy
+                    sp[5] = sp[5] + oy
+                    var row = [ch as f64]
+                    for v in sp
+                        row.push(v)
+                    out.push(row)
+            elif cs.position == P_STATIC
+                let i = ch as usize
+                oof_collect(t, ch, ox + t.x[i], oy + t.y[i], t.w[i], t.h[i], root, out)
+
 fn oof_layout(t: &mut Tree, n: i64, o: &mut Out) bound 4096
     let s = sty(t, n)
     let bor = copy(t.bord[n as usize])
     let pw = o.w
-    let rb = rect0(&s.border, pw)
-    let gx = if s.ovy == O_SCROLL then s.sbw else 0.0
-    let gy = if s.ovx == O_SCROLL then s.sbw else 0.0
-    let ins = [rb[L] + (if s.rtl then gx else 0.0), rb[R] + (if s.rtl then 0.0 else gx), rb[T], rb[B] + gy]
+    let ins = box_ins(&s, pw)
     let aw = o.w - hsum(&ins)
     let ah = o.h - vsum(&ins)
     let pad = rect0(&s.padding, pw)
-    for ch in copy(t.kids[n as usize])
+    let root = n == 0
+    if not root and s.position == P_STATIC
+        return
+    var cands: List[List[f64]] = []
+    oof_collect(t, n, 0.0, 0.0, o.w, o.h, root, &mut cands)
+    for cd in cands
+        let ch = cd[0] as i64
         let cs = sty(t, ch)
-        if is_oof(cs.position) and cs.display != D_NONE
-            # static position (area start, end, edge, safe) per axis, relative to the area
-            var hsa = 0.0
-            var hse = 0.0
-            var hedge = if s.rtl then 1 else 0
-            var hsafe = false
-            var vsa = 0.0
-            var vse = 0.0
-            var vedge = 0
-            var vsafe = false
-            if s.display == D_FLEX
-                let isrow = s.flex_dir < 2
-                let mrtl = isrow and s.rtl
-                let crtl = (not isrow) and s.rtl
-                let fr = (s.flex_dir == 1 or s.flex_dir == 3) != mrtl
-                let cr = (s.flex_wrap == 2 or s.flex_wrap == 4) != crtl
-                let cbi = [ins[L] + pad[L], ins[R] + pad[R], ins[T] + pad[T], ins[B] + pad[B]]
-                let mk = main_edge(akw(s.justify_content), fr, mrtl)
-                var a0 = if akw(cs.align_self) != A_NA then cs.align_self else s.align_items
-                if akw(a0) == A_NA
-                    a0 = A_STRETCH
-                let asafe = a0 >= SAFE
-                var ak = akw(a0)
-                let flip = (not isrow) and cs.rtl != s.rtl
-                if ak == A_SSTART
-                    ak = if flip then A_END else A_START
-                elif ak == A_SEND
-                    ak = if flip then A_START else A_END
-                let ck = cross_edge(ak, cr, crtl)
-                let hx0 = cbi[L] - ins[L]
-                let hx1 = o.w - cbi[R] - ins[L]
-                let vy0 = cbi[T] - ins[T]
-                let vy1 = o.h - cbi[B] - ins[T]
-                hsa = hx0
-                hse = hx1
-                vsa = vy0
-                vse = vy1
-                if isrow
-                    hedge = mk
-                    vedge = ck
-                    vsafe = asafe
-                else
-                    vedge = mk
-                    hedge = ck
-                    hsafe = asafe
-            else
-                hsa = t.x[ch as usize] - ins[L]
-                hse = hsa
-                vsa = t.y[ch as usize] - ins[T]
-                vse = vsa
+        let ci0 = 0
+        if true
+            let hsa = cd[1] - ins[L]
+            let hse = cd[2] - ins[L]
+            let hedge = cd[3] as i64
+            let hsafe = cd[4] > 0.5
+            let vsa = cd[5] - ins[T]
+            let vse = cd[6] - ins[T]
+            let vedge = cd[7] as i64
+            let vsafe = cd[8] > 0.5
             let m = rect_opt(&cs.margin, aw, aw)
             let cpd = rect0(&cs.padding, aw)
             let cbd = rect0(&cs.border, aw)
