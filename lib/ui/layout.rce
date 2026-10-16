@@ -437,13 +437,16 @@ pub struct Tree
     h: List[f64]
     cw: List[f64]
     ch: List[f64]
+    bord: List[List[f64]]
+    sbx: List[f64]
+    sby: List[f64]
     rows_out: List[text]
     cols_out: List[text]
 
 fn empty_i() -> List[i64] = []
 # parse "d:k;p=v;...#text" nodes joined by "/"
 pub fn parse_tree(s: &text) -> Tree
-    var t = Tree(st: [], kids: [], parent: [], has_text: [], txt: [], x: [], y: [], w: [], h: [], cw: [], ch: [], rows_out: [], cols_out: [])
+    var t = Tree(st: [], kids: [], parent: [], has_text: [], txt: [], x: [], y: [], w: [], h: [], cw: [], ch: [], bord: [], sbx: [], sby: [], rows_out: [], cols_out: [])
     var stack: List[i64] = []
     for item in s.split("/")
         var body = copy(item)
@@ -490,6 +493,9 @@ pub fn parse_tree(s: &text) -> Tree
         t.h.push(0.0)
         t.cw.push(0.0)
         t.ch.push(0.0)
+        t.bord.push([0.0, 0.0, 0.0, 0.0])
+        t.sbx.push(0.0)
+        t.sby.push(0.0)
         t.rows_out.push("")
         t.cols_out.push("")
         if p >= 0
@@ -954,19 +960,19 @@ fn flex_constants(t: &Tree, s: &Style, inp: &In) -> FC
 fn rel_inset(c: &FC, ins: &List[f64]) -> List[f64]
     let rtl_row = c.row and c.rtl
     let rtl_col = not c.row and c.rtl
-    var main = 0.0
+    var mainv = 0.0
     if rtl_row
-        main = orv(ins[me(c)], if has(ins[ms(c)]) then -ins[ms(c)] else NO)
+        mainv = orv(ins[me(c)], if has(ins[ms(c)]) then -ins[ms(c)] else NO)
     else
-        main = orv(ins[ms(c)], if has(ins[me(c)]) then -ins[me(c)] else NO)
+        mainv = orv(ins[ms(c)], if has(ins[me(c)]) then -ins[me(c)] else NO)
     var cross = 0.0
     if rtl_col
         cross = orv(if has(ins[cen(c)]) then -ins[cen(c)] else NO, ins[cst(c)])
     else
         cross = orv(ins[cst(c)], if has(ins[cen(c)]) then -ins[cen(c)] else NO)
-    main = orz(main)
+    mainv = orz(mainv)
     cross = orz(cross)
-    return if c.row then [main, cross] else [cross, main]
+    return if c.row then [mainv, cross] else [cross, mainv]
 
 fn flex_items(t: &Tree, n: i64, c: &FC) -> List[FItem]
     let m = mi(c)
@@ -999,8 +1005,897 @@ fn flex_items(t: &Tree, n: i64, c: &FC) -> List[FItem]
         idx += 1
     return out
 
-fn wh(c: &FC, main: f64, cross: f64) -> List[f64] = if c.row then [main, cross] else [cross, main]
-fn whav(c: &FC, main: Av, cross: Av, want_w: bool) -> Av
-    if c.row == want_w
-        return main
-    return cross
+
+fn flex_avail(kw: f64, kh: f64, aw: &Av, ah: &Av, c: &FC) -> List[Av]
+    var w = adef(0.0)
+    if has(kw)
+        w = adef(fmax(kw - hsum(&c.inset), 0.0))
+    else
+        w = amaxz(asub(copy(aw), hsum(&c.inset)))
+    var h = adef(0.0)
+    if has(kh)
+        h = adef(fmax(kh - vsum(&c.inset), 0.0))
+    else
+        h = amaxz(asub(copy(ah), vsum(&c.inset)))
+    return [w, h]
+
+fn base_sizes(t: &mut Tree, c: &FC, av: &List[Av], it: &mut List[FItem]) bound 4096
+    let m = mi(c)
+    let x = ci(c)
+    var k: usize = 0
+    while k < it.len() bound 100000
+        let cs = sty(t, it[k].node)
+        let cpar = c.inner[x]
+        let cps = if c.row then [NO, cpar] else [cpar, NO]
+        let tmin = sz_ratio(copy(it[k].min), it[k].ratio)
+        let tmax = sz_ratio(copy(it[k].max), it[k].ratio)
+        let avc = copy(av[x])
+        var cav = amax()
+        if avc.k == DEF
+            cav = adef(mclamp(fmax(divided_cross(c, orv(cpar, avc.v)) - csum(c, &it[k].margin), 0.0), tmin[x], tmax[x]))
+        elif avc.k == MINC
+            cav = if has(tmin[x]) then adef(tmin[x]) else amin()
+        else
+            cav = if has(tmax[x]) then adef(tmax[x]) else amax()
+        var ccdef = has(it[k].size[x])
+        var ckd = copy(it[k].size)
+        ckd[m] = NO
+        ckd[x] = mclamp(ckd[x], tmin[x], tmax[x])
+        if akw(it[k].align) == A_STRETCH and not it[k].mauto[cst(c)] and not it[k].mauto[cen(c)] and not has(ckd[x])
+            ckd[x] = aval(&cav)
+            ccdef = not c.wrap and c.hdc and has(cpar)
+        let cpd = rect0(&cs.padding, c.inner[0])
+        let cbd = rect0(&cs.border, c.inner[0])
+        let pb = radd(&cpd, &cbd)
+        let bsa = if cs.border_box then 0.0 else (if c.row then hsum(&pb) else vsum(&pb))
+        let prm = if c.kmdef then c.inner[m] else NO
+        let bst = copy(cs.basis)
+        let fb = madd(res(&bst, prm), bsa)
+        let mstretch = mmax(msub(prm, msum(c, &it[k].margin)), 0.0)
+        var basis = NO
+        var kav = Av(k: -1, v: 0.0)
+        if bst.k == CONTENT
+            pass
+        elif bst.k == MINCONT or bst.k == MAXCONT or bst.k == FITCONT or bst.k == STRETCH
+            let r = sizing_kw(&bst, mstretch, prm)
+            if r[0] == 1.0
+                it[k].bdef = true
+                basis = r[1]
+            elif r[0] == 2.0
+                kav = kw_av(r[1])
+        else
+            let cand = orv(fb, if bst.k == AUTO then it[k].size[m] else NO)
+            if has(cand)
+                it[k].bdef = true
+                basis = cand
+            elif bst.k == AUTO
+                let sm = copy(it[k].sst[m])
+                let r = sizing_kw(&sm, mstretch, prm)
+                if r[0] == 1.0
+                    it[k].bdef = true
+                    basis = r[1]
+                elif r[0] == 2.0
+                    kav = kw_av(r[1])
+        if not has(basis) and ccdef and has(it[k].ratio) and has(ckd[x])
+            it[k].bdef = true
+            basis = if c.row then ckd[x] * it[k].ratio else ckd[x] / it[k].ratio
+        if not has(basis)
+            var mav = if kav.k >= 0 then copy(kav) else (if av[m].k == MINC then amin() else amax())
+            let aw = if c.row then copy(mav) else copy(cav)
+            let ah = if c.row then copy(cav) else copy(mav)
+            basis = measure_axis(t, it[k].node, ckd[0], ckd[1], cps[0], cps[1], aw, ah, SZ_CONTENT, m as i64)
+        let pbm = msum(c, &it[k].pad) + msum(c, &it[k].bor)
+        basis = fmax(basis, pbm)
+        it[k].basis = basis
+        it[k].ibasis = basis - pbm
+        let pbax = [hsum(&it[k].pad) + hsum(&it[k].bor), vsum(&it[k].pad) + vsum(&it[k].bor)]
+        let ovm = if c.row then it[k].ovx else it[k].ovy
+        let smin = orv(it[k].min[m], if is_scroll_container(ovm) then 0.0 else NO)
+        if has(smin)
+            it[k].rmin = smin
+        else
+            let aw = if c.row then amin() else copy(cav)
+            let ah = if c.row then copy(cav) else amin()
+            let mc = measure_axis(t, it[k].node, ckd[0], ckd[1], cps[0], cps[1], aw, ah, SZ_CONTENT, m as i64)
+            it[k].rmin = mmax(mmin(mmin(mc, it[k].size[m]), tmax[m]), pbax[m])
+        let hmin = mmax(mmax(it[k].rmin, tmin[m]), pbax[m])
+        let hin = mclamp(basis, hmin, tmax[m])
+        it[k].hin[m] = hin
+        it[k].hout[m] = hin + msum(c, &it[k].margin)
+        k += 1
+
+# lines: lists of item indices
+fn flex_lines(c: &FC, av: &List[Av], it: &List[FItem]) -> List[List[i64]]
+    let m = mi(c)
+    var lines: List[List[i64]] = []
+    let all = [i as i64 for i in 0..it.len()]
+    if not c.wrap or not c.kmdef
+        lines.push(all)
+        return lines
+    var mav = copy(av[m])
+    if has(c.max[m])
+        var a = orv(aval(&av[m]), c.max[m])
+        if not c.hdm
+            a = fmin(a, c.max[m])
+        mav = adef(mmax(a, c.min[m]))
+    elif not c.row and not c.hdm and av[m].k == DEF
+        mav = amax()
+    if mav.k == MAXC
+        lines.push(all)
+        return lines
+    if mav.k == MINC
+        for i in 0..it.len()
+            lines.push([i as i64])
+        return lines
+    var cur: List[i64] = []
+    var len = 0.0
+    for i in 0..it.len()
+        let g = if cur.len() == 0 then 0.0 else c.gap[m]
+        if cur.len() > 0 and len + it[i].hout[m] + g > mav.v
+            lines.push(cur)
+            cur = [i as i64]
+            len = it[i].hout[m]
+        else
+            cur.push(i as i64)
+            len = len + it[i].hout[m] + g
+    if cur.len() > 0
+        lines.push(cur)
+    return lines
+
+fn item_kdef(c: &FC, it: &FItem) -> List[bool]
+    let x = ci(c)
+    let mdef = c.hdm or it.bdef
+    let cam = it.mauto[cst(c)] or it.mauto[cen(c)]
+    let csl = copy(it.sst[x])
+    let stretched = not cam and (csl.k == STRETCH or (akw(it.align) == A_STRETCH and csl.k == AUTO))
+    let cdef = stretched or has(it.size[x]) or (not c.row and c.cavdef)
+    return if c.row then [mdef, cdef] else [cdef, mdef]
+
+fn item_main_len(c: &FC, it: &FItem) -> f64
+    let m = mi(c)
+    let pb = msum(c, &it.pad) + msum(c, &it.bor)
+    return fmax(mmax(it.basis, it.min[m]) + msum(c, &it.margin), pb)
+
+fn container_main(t: &mut Tree, av: &List[Av], lines: &List[List[i64]], it: &mut List[FItem], c: &mut FC) bound 4096
+    let m = mi(c)
+    let x = ci(c)
+    let mcbi = msum(c, &c.inset)
+    var outer = c.outer[m]
+    if not has(outer)
+        let am = copy(av[m])
+        if am.k == DEF or (am.k == MINC and c.wrap)
+            var longest = 0.0
+            var first = true
+            for ln in lines
+                var tot = 0.0
+                for i in ln
+                    tot = tot + item_main_len(c, &it[i as usize])
+                tot = tot + gaps(c.gap[m], ln.len() as i64)
+                if first or tot > longest
+                    longest = tot
+                first = false
+            var size = longest + mcbi
+            if am.k == DEF and lines.len() > 1
+                size = fmax(size, am.v)
+            outer = size
+        else
+            var msz = 0.0
+            for ln in lines
+                var sum = 0.0
+                for ii in ln
+                    let i = ii as usize
+                    let smin = it[i].min[m]
+                    let spref = it[i].size[m]
+                    let smax = it[i].max[m]
+                    let cb = if c.row then mmax(it[i].basis, spref) else it[i].basis
+                    let fbmin = if it[i].shrink == 0.0 then cb else NO
+                    let fbmax = if it[i].grow == 0.0 then cb else NO
+                    let minm = fmax(orv(orv(mmax(smin, fbmin), fbmin), it[i].rmin), it[i].rmin)
+                    let maxm = orv(orv(mmin(smax, fbmax), fbmax), 1.0e300)
+                    let mg = msum(c, &it[i].margin)
+                    var cc = 0.0
+                    if has(spref) and (maxm <= minm or maxm <= spref)
+                        cc = fmax(fmin(spref, maxm), minm) + mg
+                    elif maxm <= minm
+                        cc = minm + mg
+                    elif is_scroll_container(it[i].ovx) or is_scroll_container(it[i].ovy)
+                        cc = it[i].basis + mg
+                    elif has(spref)
+                        let pbm = msum(c, &it[i].pad) + msum(c, &it[i].bor)
+                        let inn = fmax(spref, pbm)
+                        if c.row
+                            cc = mclamp(inn + mg, smin, smax)
+                        else
+                            cc = mclamp(fmax(inn, it[i].basis) + mg, smin, smax)
+                    else
+                        let cpar = c.inner[x]
+                        let avc = copy(av[x])
+                        var cav = copy(avc)
+                        if avc.k == DEF
+                            cav = adef(fmax(divided_cross(c, orv(cpar, avc.v)) - csum(c, &it[i].margin), 0.0))
+                        if cav.k == DEF
+                            cav = adef(mclamp(cav.v, it[i].min[x], it[i].max[x]))
+                        else
+                            # maybe_clamp on min/max-content keeps the keyword
+                            pass
+                        var ckd = copy(it[i].size)
+                        ckd[m] = NO
+                        let tmin = sz_ratio(copy(it[i].min), it[i].ratio)
+                        let tmax = sz_ratio(copy(it[i].max), it[i].ratio)
+                        ckd[x] = mclamp(ckd[x], tmin[x], tmax[x])
+                        if akw(it[i].align) == A_STRETCH and not has(ckd[x])
+                            ckd[x] = aval(&cav)
+                        let aw = if c.row then copy(av[0]) else copy(cav)
+                        let ah = if c.row then copy(cav) else copy(av[1])
+                        let meas = measure_axis(t, it[i].node, ckd[0], ckd[1], c.inner[0], c.inner[1], aw, ah, SZ_CONTENT, m as i64)
+                        var tr = NO
+                        if has(it[i].ratio) and has(ckd[x])
+                            tr = if c.row then ckd[x] * it[i].ratio else ckd[x] / it[i].ratio
+                        let inn = mmax(meas, tr)
+                        if c.row
+                            cc = mclamp(inn + mg, smin, smax)
+                        else
+                            cc = mclamp(fmax(inn, it[i].basis) + mg, smin, smax)
+                    let diff = cc - it[i].basis
+                    if diff > 0.0
+                        it[i].cff = diff / fmax(1.0, it[i].grow)
+                    elif diff < 0.0
+                        it[i].cff = diff / (fmax(1.0, it[i].shrink) * it[i].ibasis)
+                    else
+                        it[i].cff = 0.0
+                for ii in ln
+                    let i = ii as usize
+                    let ff = it[i].cff
+                    var contrib = 0.0
+                    if ff > 0.0
+                        contrib = fmax(1.0, it[i].grow) * ff
+                    elif ff < 0.0
+                        let ssf = fmax(1.0, it[i].shrink) * it[i].ibasis
+                        contrib = if ssf == 0.0 then 0.0 else ssf * ff
+                    let sz = it[i].basis + contrib
+                    it[i].otgt[m] = sz
+                    it[i].tgt[m] = sz
+                    sum = sum + sz
+                msz = fmax(msz, sum + gaps(c.gap[m], ln.len() as i64))
+            outer = msz + mcbi
+    outer = fmax(mclamp(outer, c.min[m], c.max[m]), mcbi - c.gut[m])
+    let inner = fmax(outer - mcbi, 0.0)
+    c.cs[m] = outer
+    c.ics[m] = inner
+    c.inner[m] = inner
+
+fn is_normal(x: f64) -> bool = x != 0.0 and x.abs() > 1.0e-300
+
+fn resolve_flexible(ln: &List[i64], c: &FC, it: &mut List[FItem])
+    let m = mi(c)
+    let tgap = gaps(c.gap[m], ln.len() as i64)
+    var thyp = 0.0
+    for i in ln
+        thyp = thyp + it[i as usize].hout[m]
+    let uff = tgap + thyp
+    let inm = orz(c.inner[m])
+    let growing = uff < inm
+    let shrinking = uff > inm
+    let exact = not growing and not shrinking
+    for ii in ln
+        let i = ii as usize
+        let its = it[i].hin[m]
+        it[i].tgt[m] = its
+        if exact or (it[i].grow == 0.0 and it[i].shrink == 0.0) or (growing and it[i].basis > its) or (shrinking and it[i].basis < its)
+            it[i].frozen = true
+            it[i].otgt[m] = its + msum(c, &it[i].margin)
+    if exact
+        return
+    var used = tgap
+    for ii in ln
+        let i = ii as usize
+        used = used + (if it[i].frozen then it[i].otgt[m] else it[i].basis + msum(c, &it[i].margin))
+    let initial_free = orz(msub(c.inner[m], used))
+    loop bound 100000
+        var all = true
+        for ii in ln
+            if not it[ii as usize].frozen
+                all = false
+        if all
+            break
+        var u = tgap
+        var sg = 0.0
+        var ss = 0.0
+        for ii in ln
+            let i = ii as usize
+            if it[i].frozen
+                u = u + it[i].otgt[m]
+            else
+                u = u + it[i].basis + msum(c, &it[i].margin)
+                sg = sg + it[i].grow
+                ss = ss + it[i].shrink
+        var free = 0.0
+        if growing and sg < 1.0
+            free = mmin(initial_free * sg - tgap, msub(c.inner[m], u))
+        elif shrinking and ss < 1.0
+            free = mmax(initial_free * ss - tgap, msub(c.inner[m], u))
+        else
+            free = orv(msub(c.inner[m], u), uff - u)
+        if is_normal(free)
+            if growing and sg > 0.0
+                for ii in ln
+                    let i = ii as usize
+                    if not it[i].frozen
+                        it[i].tgt[m] = it[i].basis + free * (it[i].grow / sg)
+            elif shrinking and ss > 0.0
+                var sssf = 0.0
+                for ii in ln
+                    let i = ii as usize
+                    if not it[i].frozen
+                        sssf = sssf + it[i].ibasis * it[i].shrink
+                if sssf > 0.0
+                    for ii in ln
+                        let i = ii as usize
+                        if not it[i].frozen
+                            it[i].tgt[m] = it[i].basis + free * (it[i].ibasis * it[i].shrink / sssf)
+        var tv = 0.0
+        for ii in ln
+            let i = ii as usize
+            if not it[i].frozen
+                let cl = fmax(mclamp(it[i].tgt[m], it[i].rmin, it[i].max[m]), 0.0)
+                it[i].viol = cl - it[i].tgt[m]
+                it[i].tgt[m] = cl
+                it[i].otgt[m] = cl + msum(c, &it[i].margin)
+                tv = tv + it[i].viol
+        for ii in ln
+            let i = ii as usize
+            if not it[i].frozen
+                if tv > 0.0
+                    it[i].frozen = it[i].viol > 0.0
+                elif tv < 0.0
+                    it[i].frozen = it[i].viol < 0.0
+                else
+                    it[i].frozen = true
+
+fn hyp_cross(t: &mut Tree, ln: &List[i64], c: &FC, av: &List[Av], it: &mut List[FItem]) bound 4096
+    let m = mi(c)
+    let x = ci(c)
+    for ii in ln
+        let i = ii as usize
+        let pbc = csum(c, &it[i].pad) + csum(c, &it[i].bor)
+        let cam = fmax(c.cs[m] - msum(c, &it[i].margin), 0.0)
+        let tmin = sz_ratio(copy(it[i].min), it[i].ratio)
+        let tmax = sz_ratio(copy(it[i].max), it[i].ratio)
+        let ccross = mmax(mclamp(it[i].size[x], tmin[x], tmax[x]), pbc)
+        var cac = copy(av[x])
+        if cac.k == DEF
+            cac = adef(fmax(divided_cross(c, cac.v) - csum(c, &it[i].margin), 0.0))
+        if cac.k == DEF
+            cac = adef(mmax(mclamp(cac.v, tmin[x], tmax[x]), pbc))
+        let ics = if has(c.inner[x]) then divided_cross(c, c.inner[x]) else NO
+        let cstretch = mmax(msub(ics, csum(c, &it[i].margin)), 0.0)
+        let sx = copy(it[i].sst[x])
+        let r = sizing_kw(&sx, cstretch, c.inner[x])
+        if r[0] == 2.0
+            cac = kw_av(r[1])
+        var inner = ccross
+        if not has(inner)
+            let kd = item_kdef(c, &it[i])
+            let kw = if c.row then it[i].tgt[0] else ccross
+            let kh = if c.row then ccross else it[i].tgt[1]
+            let aw = if c.row then adef(cam) else copy(cac)
+            let ah = if c.row then copy(cac) else adef(cam)
+            var ci2 = mkin(kw, kh, c.inner[0], c.inner[1], aw, ah, SZ_CONTENT, if c.row then AX_V else AX_H, RUN_SIZE)
+            ci2.kdw = kd[0]
+            ci2.kdh = kd[1]
+            let o = child(t, it[i].node, &ci2)
+            let v = if c.row then o.h else o.w
+            inner = fmax(mclamp(v, tmin[x], tmax[x]), pbc)
+        it[i].hin[x] = inner
+        it[i].hout[x] = inner + csum(c, &it[i].margin)
+
+fn child_baselines(t: &mut Tree, ks: &List[f64], av: &List[Av], lines: &List[List[i64]], c: &FC, it: &mut List[FItem]) bound 4096
+    if not c.row
+        return
+    for ln in lines
+        var cnt = 0
+        for i in ln
+            if baseline_part(c, &it[i as usize])
+                cnt += 1
+        if cnt > 1
+            for ii in ln
+                let i = ii as usize
+                if baseline_part(c, &it[i])
+                    let kd = item_kdef(c, &it[i])
+                    let aw0 = adef(c.cs[0])
+                    let ah0 = aset(copy(av[1]), ks[1])
+                    let aw = amaxz(asub(aw0, hsum(&it[i].margin)))
+                    let ah = amaxz(asub(ah0, vsum(&it[i].margin)))
+                    var ci2 = mkin(it[i].tgt[0], it[i].hin[1], c.inner[0], c.inner[1], aw, ah, SZ_CONTENT, AX_BOTH, RUN_PERFORM)
+                    ci2.kdw = kd[0]
+                    ci2.kdh = kd[1]
+                    let o = child(t, it[i].node, &ci2)
+                    var b = orv(o.by, o.h)
+                    if is_scroll_container(it[i].ovy)
+                        b = fmax(fmin(b, o.h), 0.0)
+                    it[i].baseline = b + it[i].margin[T]
+
+fn cross_sizes(lines: &List[List[i64]], cross: &mut List[f64], ks: &List[f64], c: &FC, it: &List[FItem])
+    let x = ci(c)
+    let cpb = csum(c, &c.inset)
+    if not c.wrap and has(ks[x])
+        cross[0] = orz(mmax(msub(mclamp(ks[x], c.min[x], c.max[x]), cpb), 0.0))
+        return
+    var k: usize = 0
+    for ln in lines
+        var mb = 0.0
+        for i in ln
+            mb = fmax(mb, it[i as usize].baseline)
+        var cs = 0.0
+        for ii in ln
+            let i = ii as usize
+            let v = if baseline_part(c, &it[i]) then mb - it[i].baseline + it[i].hout[x] else it[i].hout[x]
+            cs = fmax(cs, v)
+        cross[k] = cs
+        k += 1
+    if not c.wrap
+        cross[0] = mclamp(cross[0], msub(c.min[x], cpb), msub(c.max[x], cpb))
+
+fn align_stretch(cross: &mut List[f64], ks: &List[f64], c: &FC)
+    if akw(c.ac) != A_STRETCH
+        return
+    let x = ci(c)
+    let cpb = csum(c, &c.inset)
+    let cmin = orz(mmax(msub(mclamp(orv(ks[x], c.min[x]), c.min[x], c.max[x]), cpb), 0.0))
+    var tot = gaps(c.gap[x], cross.len() as i64)
+    for v in cross
+        tot = tot + v
+    if tot < cmin
+        let add = (cmin - tot) / (cross.len() as f64)
+        for k in 0..cross.len()
+            cross[k] = cross[k] + add
+
+fn used_cross(t: &Tree, lines: &List[List[i64]], cross: &List[f64], c: &FC, it: &mut List[FItem])
+    let x = ci(c)
+    var k: usize = 0
+    for ln in lines
+        let lcs = cross[k]
+        for ii in ln
+            let i = ii as usize
+            let cs = sty(t, it[i].node)
+            let sx = copy(it[i].sst[x])
+            if not it[i].mauto[cst(c)] and not it[i].mauto[cen(c)] and (sx.k == STRETCH or (akw(it[i].align) == A_STRETCH and sx.k == AUTO))
+                let cpd = rect0(&cs.padding, c.inner[0])
+                let cbd = rect0(&cs.border, c.inner[0])
+                let pb = radd(&cpd, &cbd)
+                let bsa = if cs.border_box then [0.0, 0.0] else [hsum(&pb), vsum(&pb)]
+                let mx0 = sz_res(&cs.max, c.inner[0], c.inner[1])
+                let mx = sz_add(mx0, bsa)
+                it[i].tgt[x] = mclamp(fmax(lcs - csum(c, &it[i].margin), 0.0), it[i].min[x], mx[x])
+            else
+                it[i].tgt[x] = it[i].hin[x]
+            it[i].otgt[x] = it[i].tgt[x] + csum(c, &it[i].margin)
+        k += 1
+
+fn distribute_free(lines: &List[List[i64]], c: &FC, it: &mut List[FItem])
+    let m = mi(c)
+    for ln in lines
+        let tgap = gaps(c.gap[m], ln.len() as i64)
+        var used = tgap
+        for i in ln
+            used = used + it[i as usize].otgt[m]
+        var free = c.ics[m] - used
+        var na = 0
+        for ii in ln
+            let i = ii as usize
+            if it[i].mauto[ms(c)]
+                na += 1
+            if it[i].mauto[me(c)]
+                na += 1
+        if free > 0.0 and na > 0
+            let mg = free / (na as f64)
+            for ii in ln
+                let i = ii as usize
+                if it[i].mauto[ms(c)]
+                    it[i].margin[ms(c)] = mg
+                if it[i].mauto[me(c)]
+                    it[i].margin[me(c)] = mg
+            free = 0.0
+        let n = ln.len() as i64
+        let rev = frev(c)
+        let mode = align_fallback(free, n, c.jc)
+        var j: i64 = 0
+        while j < n bound 100000
+            let idx = if rev then ln[(n - 1 - j) as usize] else ln[j as usize]
+            it[idx as usize].offm = align_offset(free, n, c.gap[m], mode, rev, j == 0)
+            j += 1
+
+fn cross_item_align(c: &FC, it: &FItem, free: f64, mb: f64, mbb: f64) -> f64
+    let rev = not c.row and c.rtl
+    var k = akw(it.align)
+    if it.align >= SAFE and free < 0.0
+        k = A_START
+    if k == A_START
+        return if rev then free else 0.0
+    if k == A_FSTART or k == A_STRETCH
+        return if c.wrev != rev then free else 0.0
+    if k == A_END
+        return if rev then 0.0 else free
+    if k == A_FEND
+        return if c.wrev != rev then 0.0 else free
+    if k == A_CENTER
+        return free / 2.0
+    if k == A_BASE
+        if c.row
+            if c.wrev
+                let lcs = free + it.otgt[ci(c)]
+                return lcs - mbb - it.baseline
+            return mb - it.baseline
+        let bcr = rev and not c.wrap
+        return if c.wrev != bcr then free else 0.0
+    return 0.0
+
+fn cross_auto_margins(lines: &List[List[i64]], cross: &List[f64], c: &FC, it: &mut List[FItem])
+    let x = ci(c)
+    var k: usize = 0
+    for ln in lines
+        let lcs = cross[k]
+        var mb = 0.0
+        var mbb = 0.0
+        for ii in ln
+            let i = ii as usize
+            mb = fmax(mb, it[i].baseline)
+            if baseline_part(c, &it[i])
+                mbb = fmax(mbb, it[i].otgt[x] - it[i].baseline)
+        for ii in ln
+            let i = ii as usize
+            let free = lcs - it[i].otgt[x]
+            let a = it[i].mauto[cst(c)]
+            let b = it[i].mauto[cen(c)]
+            if a and b
+                it[i].margin[cst(c)] = free / 2.0
+                it[i].margin[cen(c)] = free / 2.0
+            elif a
+                it[i].margin[cst(c)] = free
+            elif b
+                it[i].margin[cen(c)] = free
+            else
+                it[i].offc = cross_item_align(c, &it[i], free, mb, mbb)
+        k += 1
+
+fn container_cross(cross: &List[f64], ks: &List[f64], c: &mut FC) -> f64
+    let x = ci(c)
+    let tgap = gaps(c.gap[x], cross.len() as i64)
+    var tot = 0.0
+    for v in cross
+        tot = tot + v
+    let pbs = csum(c, &c.inset)
+    let outer = fmax(mclamp(orv(ks[x], tot + tgap + pbs), c.min[x], c.max[x]), pbs - c.gut[x])
+    c.cs[x] = outer
+    c.ics[x] = fmax(outer - pbs, 0.0)
+    return tot
+
+fn align_lines(cross: &List[f64], off: &mut List[f64], c: &FC, tot: f64)
+    let x = ci(c)
+    let n = cross.len() as i64
+    let free = c.ics[x] - tot - gaps(c.gap[x], n)
+    let mode = align_fallback(free, n, c.ac)
+    var j: i64 = 0
+    while j < n bound 100000
+        let idx = if c.wrev then n - 1 - j else j
+        off[idx as usize] = align_offset(free, n, c.gap[x], mode, c.wrev, j == 0)
+        j += 1
+
+fn flex_item_final(t: &mut Tree, c: &FC, it: &mut FItem, tom: f64, toc: f64, loff: f64, ovr: &mut List[f64]) -> f64 bound 4096
+    let kd = item_kdef(c, it)
+    let aw = adef(fmax(c.cs[0] - hsum(&it.margin), 0.0))
+    let ah = adef(fmax(c.cs[1] - vsum(&it.margin), 0.0))
+    var ci2 = mkin(it.tgt[0], it.tgt[1], c.inner[0], c.inner[1], aw, ah, SZ_CONTENT, AX_BOTH, RUN_PERFORM)
+    ci2.kdw = kd[0]
+    ci2.kdh = kd[1]
+    let o = child(t, it.node, &ci2)
+    let m = mi(c)
+    let rtl_row = c.row and c.rtl
+    let rtl_col = not c.row and c.rtl
+    let mri = if c.row then it.rel[0] else it.rel[1]
+    let cri = if c.row then it.rel[1] else it.rel[0]
+    let eloff = if rtl_col then 0.0 else loff
+    var om = 0.0
+    if rtl_row
+        om = tom - it.offm - it.margin[me(c)] - mri - o.w
+    else
+        om = tom + it.offm + it.margin[ms(c)] + mri
+    let oc = toc + it.offc + eloff + it.margin[cst(c)] + cri
+    if c.row
+        let boc = toc + it.offc + eloff + it.margin[cst(c)]
+        var ib = orv(o.by, o.h)
+        if is_scroll_container(it.ovy)
+            ib = fmax(fmin(ib, o.h), 0.0)
+        it.baseline = boc + ib
+    else
+        let bom = tom + it.offm + it.margin[ms(c)]
+        it.baseline = bom + orv(o.by, o.h)
+    let lx = if c.row then om else oc
+    let ly = if c.row then oc else om
+    set_layout(t, it.node, lx, ly, o.w, o.h, o.orr, o.ob)
+    set_box(t, it.node, &it.bor, it.ovx, it.ovy, it.sbw)
+    let szm = if c.row then o.w else o.h
+    let s = sty(t, it.node)
+    var cx = lx - c.bor[L]
+    if c.rtl
+        cx = c.cs[0] - (lx + o.w) - c.bor[R]
+    let oc2 = overflow_contrib(cx, ly - c.bor[T], o.w, o.h, &o, &s, c.sc)
+    let u = runion(ovr, &oc2)
+    for q in 0..4
+        ovr[q] = u[q]
+    if rtl_row
+        return tom - (it.offm + msum(c, &it.margin) + szm)
+    return tom + it.offm + msum(c, &it.margin) + szm
+
+fn flex_final(t: &mut Tree, lines: &List[List[i64]], cross: &List[f64], off: &List[f64], c: &FC, it: &mut List[FItem]) -> List[f64] bound 4096
+    var toc = if not c.row and c.rtl then c.cs[0] - c.inset[cen(c)] else c.inset[cst(c)]
+    var ovr = [0.0, 0.0, 0.0, 0.0]
+    let nl = lines.len()
+    var j: usize = 0
+    while j < nl bound 100000
+        let li = if c.wrev then nl - 1 - j else j
+        let ln = copy(lines[li])
+        var tom = if c.rtl and c.row then c.cs[0] - c.inset[me(c)] else c.inset[ms(c)]
+        let loff = off[li]
+        let rtl_col = c.rtl and not c.row
+        if rtl_col
+            toc = toc - (loff + cross[li])
+        let n = ln.len()
+        var q: usize = 0
+        while q < n bound 100000
+            let idx = if frev(c) then ln[n - 1 - q] else ln[q]
+            var item = copy(it[idx as usize])
+            tom = flex_item_final(t, c, &mut item, tom, toc, loff, &mut ovr)
+            it[idx as usize] = item
+            q += 1
+        if not rtl_col
+            toc = toc + loff + cross[li]
+        j += 1
+    if c.sc
+        if c.rtl
+            ovr[1] = ovr[1] + c.inset[L] - c.bor[L] - c.gut[0]
+        else
+            ovr[1] = ovr[1] + c.inset[R] - c.bor[R] - c.gut[0]
+        ovr[3] = ovr[3] + c.inset[B] - c.bor[B] - c.gut[1]
+    return ovr
+
+fn flex_prelim(t: &mut Tree, n: i64, inp: &In) -> Out bound 4096
+    let s = sty(t, n)
+    var c = flex_constants(t, &s, inp)
+    var it = flex_items(t, n, &c)
+    let av = flex_avail(inp.kw, inp.kh, &inp.aw, &inp.ah, &c)
+    base_sizes(t, &c, &av, &mut it)
+    let lines = flex_lines(&c, &av, &it)
+    let m = mi(&c)
+    let x = ci(&c)
+    if has(c.inner[m])
+        c.ics[m] = c.inner[m]
+        c.cs[m] = c.inner[m] + msum(&c, &c.inset)
+    else
+        container_main(t, &av, &lines, &mut it, &mut c)
+        c.outer[m] = c.cs[m]
+        let gl = copy(s.gap[m])
+        c.gap[m] = res0(&gl, c.ics[m])
+    if inp.run == RUN_SIZE
+        if (inp.axis == AX_H and c.row) or (inp.axis == AX_V and not c.row)
+            return if c.row then out_size(c.cs[0], 0.0) else out_size(0.0, c.cs[1])
+    for ln in lines
+        resolve_flexible(&ln, &c, &mut it)
+    for ln in lines
+        hyp_cross(t, &ln, &c, &av, &mut it)
+    let ks = [inp.kw, inp.kh]
+    child_baselines(t, &ks, &av, &lines, &c, &mut it)
+    var cross = [0.0 for q in 0..lines.len()]
+    cross_sizes(&lines, &mut cross, &ks, &c, &it)
+    align_stretch(&mut cross, &ks, &c)
+    used_cross(t, &lines, &cross, &c, &mut it)
+    distribute_free(&lines, &c, &mut it)
+    cross_auto_margins(&lines, &cross, &c, &mut it)
+    let tot = container_cross(&cross, &ks, &mut c)
+    if inp.run == RUN_SIZE
+        return out_size(c.cs[0], c.cs[1])
+    var off = [0.0 for q in 0..lines.len()]
+    align_lines(&cross, &mut off, &c, tot)
+    let ovr = flex_final(t, &lines, &cross, &off, &c, &mut it)
+    # hidden children
+    for ch in copy(t.kids[n as usize])
+        if t.st[ch as usize].display == D_NONE
+            hide(t, ch)
+    var o = out_size(c.cs[0], c.cs[1])
+    o.ol = ovr[0]
+    o.orr = ovr[1]
+    o.ot = ovr[2]
+    o.ob = ovr[3]
+    if lines.len() > 0
+        let fl = if c.wrev then copy(lines[lines.len() - 1]) else copy(lines[0])
+        if fl.len() > 0
+            if not c.row
+                let q = if frev(&c) then fl[fl.len() - 1] else fl[0]
+                o.by = it[q as usize].baseline
+            else
+                var pick = fl[0]
+                var found = false
+                for q in fl
+                    if not found and baseline_part(&c, &it[q as usize])
+                        pick = q
+                        found = true
+                o.by = it[pick as usize].baseline
+    # abs-pos area for positioned children: padding box minus scrollbar gutter
+    t.cw[n as usize] = 0.0
+    return o
+
+# placeholders until block and grid land
+fn block_layout(t: &mut Tree, n: i64, inp: &In) -> Out bound 4096 = leaf_layout(t, n, inp)
+fn grid_layout(t: &mut Tree, n: i64, inp: &In) -> Out bound 4096 = leaf_layout(t, n, inp)
+fn oof_layout(t: &mut Tree, n: i64, o: &mut Out) bound 4096
+    pass
+
+fn set_box(t: &mut Tree, n: i64, bor: &List[f64], ovx: i64, ovy: i64, sbw: f64)
+    let i = n as usize
+    t.bord[i] = copy(bor)
+    t.sbx[i] = if ovy == O_SCROLL then sbw else 0.0
+    t.sby[i] = if ovx == O_SCROLL then sbw else 0.0
+
+# root layout (Taffy compute_root_layout, in-flow root)
+fn root_layout(t: &mut Tree, aw: Av, ah: Av) bound 4096
+    let s = sty(t, 0)
+    let awv = aval(&aw)
+    let ahv = aval(&ah)
+    let mg = rect0(&s.margin, awv)
+    let raw = amaxz(asub(copy(aw), hsum(&mg)))
+    let rah = amaxz(asub(copy(ah), vsum(&mg)))
+    var kw = NO
+    var kh = NO
+    if is_block_style(&s)
+        let pad = rect0(&s.padding, awv)
+        let bor = rect0(&s.border, awv)
+        let pbs = [hsum(&pad) + hsum(&bor), vsum(&pad) + vsum(&bor)]
+        let bsa = if s.border_box then [0.0, 0.0] else copy(pbs)
+        let a1 = sz_res(&s.min, awv, ahv)
+        let mn = sz_add(sz_ratio(a1, s.ratio), copy(bsa))
+        let a2 = sz_res(&s.max, awv, ahv)
+        let mx = sz_add(sz_ratio(a2, s.ratio), copy(bsa))
+        let a3 = sz_res(&s.size, awv, ahv)
+        let cs = sz_clamp(sz_add(sz_ratio(a3, s.ratio), copy(bsa)), copy(mn), copy(mx))
+        let mmd = minmax_def(&mn, &mx)
+        let k = sz_max(sz_or(sz_or(mmd, cs), [aval(&raw), NO]), copy(pbs))
+        kw = k[0]
+        kh = k[1]
+    var i = mkin(kw, kh, awv, ahv, raw, rah, SZ_INHERENT, AX_BOTH, RUN_PERFORM)
+    let o = child(t, 0, &i)
+    let pad = rect0(&s.padding, awv)
+    let bor = rect0(&s.border, awv)
+    var x = if s.rtl and has(awv) then awv - o.w - mg[R] else mg[L]
+    var y = mg[T]
+    if s.position == P_REL
+        let ins = rect_opt(&s.inset, awv, ahv)
+        if s.rtl
+            x = x + orz(orv(if has(ins[R]) then -ins[R] else NO, ins[L]))
+        else
+            x = x + orz(orv(ins[L], if has(ins[R]) then -ins[R] else NO))
+        y = y + orz(orv(ins[T], if has(ins[B]) then -ins[B] else NO))
+    set_layout(t, 0, x, y, o.w, o.h, o.orr, o.ob)
+    set_box(t, 0, &bor, s.ovx, s.ovy, s.sbw)
+
+# rounding pass (Taffy round_layout) and the output line of each node
+fn round_out(t: &Tree, n: i64, px: f64, py: f64, rnd_on: bool, out: &mut List[text]) bound 4096
+    let i = n as usize
+    let cx = px + t.x[i]
+    let cy = py + t.y[i]
+    var x = t.x[i]
+    var y = t.y[i]
+    var w = t.w[i]
+    var h = t.h[i]
+    var sw = 0.0
+    var sh = 0.0
+    let b = copy(t.bord[i])
+    if rnd_on
+        x = rnd(cx) - rnd(px)
+        y = rnd(cy) - rnd(py)
+        w = rnd(cx + t.w[i]) - rnd(cx)
+        h = rnd(cy + t.h[i]) - rnd(cy)
+        let bl = rnd(cx + b[L]) - rnd(cx)
+        let br = rnd(cx + t.w[i]) - rnd(cx + t.w[i] - b[R])
+        let bt = rnd(cy + b[T]) - rnd(cy)
+        let bb = rnd(cy + t.h[i]) - rnd(cy + t.h[i] - b[B])
+        let orr = rnd(cx + t.cw[i]) - rnd(cx)
+        let ob = rnd(cy + t.ch[i]) - rnd(cy)
+        sw = fmax(0.0, orr + fmin(rnd(t.sbx[i]), w) - w + bl + br)
+        sh = fmax(0.0, ob + fmin(rnd(t.sby[i]), h) - h + bt + bb)
+    else
+        sw = fmax(0.0, t.cw[i] + fmin(t.sbx[i], w) - w + b[L] + b[R])
+        sh = fmax(0.0, t.ch[i] + fmin(t.sby[i], h) - h + b[T] + b[B])
+    out.push(x.tostr() + " " + y.tostr() + " " + w.tostr() + " " + h.tostr() + " s" + sw.tostr() + "," + sh.tostr() + " r[" + t.rows_out[i] + "] c[" + t.cols_out[i] + "]")
+    for c in copy(t.kids[i])
+        round_out(t, c, cx, cy, rnd_on, out)
+
+fn vp(s: &text) -> Av
+    if s == "max-content"
+        return amax()
+    if s == "min-content"
+        return amin()
+    return adef(num(s))
+
+# lay(viewport, use-rounding, tree): one "x y w h sW,H r[..] c[..]" per node
+pub fn lay_lines(v: &text, rnd_on: &text, s: &text) -> List[text]
+    var t = parse_tree(s)
+    let p = v.split(" ")
+    root_layout(&mut t, vp(&p[0]), vp(&p[1]))
+    var out: List[text] = []
+    round_out(&t, 0, 0.0, 0.0, rnd_on == "true", &mut out)
+    return out
+
+# the comparison of Taffy's tests/xml.rs: positions and sizes within 0.1,
+# scroll sizes and track lists only where the expectation gives them
+fn near(a: &text, b: &text) -> bool = (num(a) - num(b)).abs() < 0.1
+fn tracks_near(e: &text, a: &text) -> bool
+    let et = e.split(" ")
+    let at = a.split(" ")
+    var ev: List[text] = []
+    var avl: List[text] = []
+    for q in et
+        if q != "" and q != "none"
+            ev.push(copy(q))
+    for q in at
+        if q != "" and q != "none"
+            avl.push(copy(q))
+    if ev.len() != avl.len()
+        return false
+    for k in 0..ev.len()
+        if ev[k].endswith("px") and avl[k].endswith("px")
+            if not near(&ev[k], &avl[k])
+                return false
+        elif ev[k] != avl[k]
+            return false
+    return true
+fn bracket(s: &text, tag: &text) -> text
+    let p = s.split(tag + "[")
+    if p.len() < 2
+        return ""
+    let q = p[1].split("]")
+    # names in brackets nest one level: rejoin up to the matching close
+    var depth = 1
+    var out = ""
+    var k: usize = 0
+    let body = copy(p[1])
+    while k < body.len() bound 100000
+        let ch = body[k]
+        if ch == 91
+            depth += 1
+        elif ch == 93
+            depth -= 1
+            if depth == 0
+                return out
+        out = out + body[k:k + 1]
+        k += 1
+    return copy(q[0])
+pub fn lay_ok(v: text, rnd_on: text, s: text, exp: text) -> bool
+    let got = lay_lines(&v, &rnd_on, &s)
+    let want = exp.split(";")
+    if got.len() != want.len()
+        return false
+    for k in 0..want.len()
+        let e = want[k].split(" ")
+        let a = got[k].split(" ")
+        for q in 0..4
+            if not near(&e[q], &a[q])
+                return false
+        if want[k].contains(" s")
+            let es = e[4].split(",")
+            let sa = a[4].split(",")
+            let e0 = es[0].split("s")
+            let a0 = sa[0].split("s")
+            if not near(&e0[1], &a0[1]) or not near(&es[1], &sa[1])
+                return false
+        if want[k].contains(" r[")
+            let rt = " r"
+            let ct = " c"
+            let er = bracket(&want[k], &rt)
+            let ar = bracket(&got[k], &rt)
+            let ec = bracket(&want[k], &ct)
+            let ac = bracket(&got[k], &ct)
+            if ar != "" or ac != ""
+                if not tracks_near(&er, &ar) or not tracks_near(&ec, &ac)
+                    return false
+    return true
+pub fn lay(v: text, rnd_on: text, s: text) -> text = ";".join(lay_lines(&v, &rnd_on, &s))
