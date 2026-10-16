@@ -76,11 +76,10 @@ fn num(s: &text) -> f64
     if s.len() > 0 and s[0] == 45
         neg = true
         i = 1
-    var ip: i64 = 0
+    var r = 0.0
     while i < s.len() and s[i] >= 48 and s[i] <= 57 bound 64
-        ip = ip * 10 + (s[i] as i64 - 48)
+        r = r * 10.0 + ((s[i] as i64 - 48) as f64)
         i += 1
-    var r = ip as f64
     if i < s.len() and s[i] == 46
         i += 1
         var sc = 0.1
@@ -1866,7 +1865,7 @@ fn set_box(t: &mut Tree, n: i64, bor: &List[f64], ovx: i64, ovy: i64, sbw: f64)
     t.sby[i] = if ovx == O_SCROLL then sbw else 0.0
 
 # root layout (Taffy compute_root_layout, in-flow root)
-fn root_layout(t: &mut Tree, aw: Av, ah: Av) bound 4096
+fn root_inflow(t: &mut Tree, aw: Av, ah: Av) bound 4096
     let s = sty(t, 0)
     let awv = aval(&aw)
     let ahv = aval(&ah)
@@ -2028,6 +2027,41 @@ pub fn lay_ok(v: text, rnd_on: text, s: text, exp: text) -> bool
                     return false
     return true
 pub fn lay(v: text, rnd_on: text, s: text) -> text = ";".join(lay_lines(&v, &rnd_on, &s))
+
+# root layout (Taffy compute_root_layout): out-of-flow root against the ICB, then the ICB pass
+fn root_layout(t: &mut Tree, aw: Av, ah: Av) bound 4096
+    let s = sty(t, 0)
+    let awv = aval(&aw)
+    let ahv = aval(&ah)
+    let z4 = [0.0, 0.0, 0.0, 0.0]
+    if is_oof(s.position) and has(awv) and has(ahv)
+        let sx = if s.rtl then awv else 0.0
+        let cd = [0.0, sx, sx, if s.rtl then 1.0 else 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        let oc0 = oof_box(t, 0, &cd, awv, ahv, 0.0, 0.0, s.rtl, O_VIS, O_VIS, awv, &z4)
+    else
+        root_inflow(t, aw, ah)
+    let mode = if s.position == P_STATIC then 1 else 2
+    let w = t.w[0]
+    let h = t.h[0]
+    var cands: List[List[f64]] = []
+    oof_collect(t, 0, 0.0, 0.0, w, h, mode, &mut cands)
+    if cands.len() == 0
+        return
+    let bor = copy(t.bord[0])
+    let sbx = t.sbx[0]
+    let sby = t.sby[0]
+    var arw = w - bor[L] - bor[R] - sbx
+    var arx = bor[L]
+    if has(awv)
+        arw = fmax(awv - sbx, 0.0)
+        arx = -t.x[0]
+    var arh = h - bor[T] - bor[B] - sby
+    var ary = bor[T]
+    if has(ahv)
+        arh = fmax(ahv - sby, 0.0)
+        ary = -t.y[0]
+    for cd in cands
+        let oc = oof_box(t, cd[0] as i64, &cd, arw, arh, arx, ary, s.rtl, s.ovx, s.ovy, w, &bor)
 
 # ---- block layout (Taffy compute/block.rs; floats not yet) ----
 # collapsible margin set: [positive, negative]
@@ -2511,11 +2545,11 @@ fn main_edge(k: i64, fr: bool, mrtl: bool) -> i64
     if k == A_FEND
         return if fr then 0 else 1
     return if fr then 1 else 0
-fn cross_edge(k: i64, cr: bool, crtl: bool) -> i64
+fn cross_edge(k: i64, cr: bool, xrtl: bool) -> i64
     if k == A_START or k == A_BASE
-        return if crtl then 1 else 0
+        return if xrtl then 1 else 0
     if k == A_END
-        return if crtl then 0 else 1
+        return if xrtl then 0 else 1
     if k == A_CENTER
         return 2
     if k == A_FEND
@@ -2560,9 +2594,9 @@ fn static_pos(t: &Tree, p: i64, ch: i64, w: f64, h: f64) -> List[f64]
     if s.display == D_FLEX
         let isrow = s.flex_dir < 2
         let mrtl = isrow and s.rtl
-        let crtl = (not isrow) and s.rtl
+        let xrtl = (not isrow) and s.rtl
         let fr = (s.flex_dir == 1 or s.flex_dir == 3) != mrtl
-        let cr = (s.flex_wrap == 2 or s.flex_wrap == 4) != crtl
+        let cr = (s.flex_wrap == 2 or s.flex_wrap == 4) != xrtl
         let cbi = [pins[L] + ppad[L], pins[R] + ppad[R], pins[T] + ppad[T], pins[B] + ppad[B]]
         let mk = main_edge(akw(s.justify_content), fr, mrtl)
         var a0 = if akw(cs.align_self) != A_NA then cs.align_self else s.align_items
@@ -2575,7 +2609,7 @@ fn static_pos(t: &Tree, p: i64, ch: i64, w: f64, h: f64) -> List[f64]
             ak = if flip then A_END else A_START
         elif ak == A_SEND
             ak = if flip then A_START else A_END
-        let ck = cross_edge(ak, cr, crtl)
+        let ck = cross_edge(ak, cr, xrtl)
         let hx0 = cbi[L]
         let hx1 = w - cbi[R]
         let vy0 = cbi[T]
@@ -2599,12 +2633,13 @@ fn static_pos(t: &Tree, p: i64, ch: i64, w: f64, h: f64) -> List[f64]
         vse = vsa
     return [hsa, hse, hedge as f64, if hsafe then 1.0 else 0.0, vsa, vse, vedge as f64, if vsafe then 1.0 else 0.0]
 # collect positioned descendants claimed by the owner, through static boxes
-fn oof_collect(t: &Tree, p: i64, ox: f64, oy: f64, w: f64, h: f64, root: bool, out: &mut List[List[f64]]) bound 4096
+# mode 0: absolute boxes for a positioned owner; 1: root pass (fixed, and absolute with no positioned ancestor); 2: root pass below a positioned box (fixed only)
+fn oof_collect(t: &Tree, p: i64, ox: f64, oy: f64, w: f64, h: f64, mode: i64, out: &mut List[List[f64]]) bound 4096
     for ch in copy(t.kids[p as usize])
         let cs = sty(t, ch)
         if cs.display != D_NONE
             if is_oof(cs.position)
-                if root or cs.position == P_ABS
+                if (mode == 0 and cs.position == P_ABS) or (mode == 1) or (mode == 2 and cs.position == P_FIXED)
                     var sp = static_pos(t, p, ch, w, h)
                     sp[0] = sp[0] + ox
                     sp[1] = sp[1] + ox
@@ -2614,120 +2649,120 @@ fn oof_collect(t: &Tree, p: i64, ox: f64, oy: f64, w: f64, h: f64, root: bool, o
                     for v in sp
                         row.push(v)
                     out.push(row)
-            elif cs.position == P_STATIC
+            if cs.position == P_STATIC or mode > 0
                 let i = ch as usize
-                oof_collect(t, ch, ox + t.x[i], oy + t.y[i], t.w[i], t.h[i], root, out)
+                let md = if mode == 0 then 0 else (if cs.position == P_STATIC then mode else 2)
+                if not (mode == 0 and cs.position != P_STATIC)
+                    oof_collect(t, ch, ox + t.x[i], oy + t.y[i], t.w[i], t.h[i], md, out)
+
+fn oof_box(t: &mut Tree, ch: i64, cd: &List[f64], aw: f64, ah: f64, offx: f64, offy: f64, rtl: bool, ovx: i64, ovy: i64, ow: f64, bor: &List[f64]) -> List[f64] bound 4096
+    let cs = sty(t, ch)
+    let hsa = cd[1] - offx
+    let hse = cd[2] - offx
+    let hedge = cd[3] as i64
+    let hsafe = cd[4] > 0.5
+    let vsa = cd[5] - offy
+    let vse = cd[6] - offy
+    let vedge = cd[7] as i64
+    let vsafe = cd[8] > 0.5
+    let m = rect_opt(&cs.margin, aw, aw)
+    let cpd = rect0(&cs.padding, aw)
+    let cbd = rect0(&cs.border, aw)
+    let cpb = radd(&cpd, &cbd)
+    let pbs = [hsum(&cpb), vsum(&cpb)]
+    let bsa = if cs.border_box then [0.0, 0.0] else copy(pbs)
+    let il = res(&cs.inset[L], aw)
+    let ir = res(&cs.inset[R], aw)
+    let it = res(&cs.inset[T], ah)
+    let ib = res(&cs.inset[B], ah)
+    let a3 = sz_res(&cs.size, aw, ah)
+    let ssz = sz_add(sz_ratio(a3, cs.ratio), copy(bsa))
+    let a1 = sz_res(&cs.min, aw, ah)
+    var mn = sz_max(sz_or(sz_add(sz_ratio(a1, cs.ratio), copy(bsa)), copy(pbs)), copy(pbs))
+    let a2 = sz_res(&cs.max, aw, ah)
+    let mx = sz_add(sz_ratio(a2, cs.ratio), copy(bsa))
+    var kd = sz_clamp(ssz, copy(mn), copy(mx))
+    var js = if akw(cs.justify_self) != A_NA then cs.justify_self else A_NA
+    let flip = cs.rtl != rtl
+    if akw(js) == A_SSTART
+        js = js - A_SSTART + (if flip then A_END else A_START)
+    elif akw(js) == A_SEND
+        js = js - A_SEND + (if flip then A_START else A_END)
+    var als = cs.align_self
+    if akw(als) == A_SSTART
+        als = als - A_SSTART + A_START
+    elif akw(als) == A_SEND
+        als = als - A_SEND + A_END
+    let hal = oof_align(js)
+    let val = oof_align(als)
+    let himc = imcb(aw, il, ir, hsa, hse, hedge, rtl)
+    let vimc = imcb(ah, it, ib, vsa, vse, vedge, false)
+    let sfw = fmax(himc[1] - himc[0] - orz(m[L]) - orz(m[R]), 0.0)
+    let sfh = fmax(vimc[1] - vimc[0] - orz(m[T]) - orz(m[B]), 0.0)
+    let avw = mclamp(sfw, mn[0], mx[0])
+    let avh = mclamp(sfh, mn[1], mx[1])
+    let swl = copy(cs.size[0])
+    let shl = copy(cs.size[1])
+    if swl.k >= MINCONT and swl.k <= STRETCH and not has(kd[0])
+        let strw = fmax(aw - orz(il) - orz(ir) - orz(m[L]) - orz(m[R]), 0.0)
+        let r = sizing_kw(&swl, strw, aw)
+        if r[0] == 1.0
+            kd[0] = r[1]
+        elif r[0] == 2.0
+            let strh = fmax(ah - orz(it) - orz(ib) - orz(m[T]) - orz(m[B]), 0.0)
+            kd[0] = measure_axis(t, ch, NO, kd[1], aw, ah, kw_av(r[1]), adef(strh), SZ_CONTENT, 0)
+    if shl.k >= MINCONT and shl.k <= STRETCH and not has(kd[1])
+        let strh = fmax(ah - orz(it) - orz(ib) - orz(m[T]) - orz(m[B]), 0.0)
+        let r = sizing_kw(&shl, strh, ah)
+        if r[0] == 1.0
+            kd[1] = r[1]
+        elif r[0] == 2.0
+            let wav = if has(kd[0]) then adef(kd[0]) else adef(avw)
+            kd[1] = measure_axis(t, ch, kd[0], NO, aw, ah, wav, kw_av(r[1]), SZ_CONTENT, 1)
+    kd = sz_clamp(sz_ratio(kd, cs.ratio), copy(mn), copy(mx))
+    let stw = not has(kd[0]) and has(il) and has(ir) and (hal == 1 or hal == 0)
+    let sth = not has(kd[1]) and has(it) and has(ib) and (val == 1 or val == 0)
+    let sar = if stw and sth and hal == 1 and val == 1 then NO else cs.ratio
+    if stw
+        kd[0] = sfw
+        kd = sz_clamp(sz_ratio(kd, sar), copy(mn), copy(mx))
+    if not has(kd[1]) and sth
+        kd[1] = sfh
+        kd = sz_clamp(sz_ratio(kd, sar), copy(mn), copy(mx))
+    var fs = copy(kd)
+    if not has(kd[0]) or not has(kd[1])
+        let mbs = measure_both(t, ch, kd[0], kd[1], aw, ah, adef(avw), adef(avh), SZ_CONTENT)
+        fs = [orv(kd[0], mbs[0]), orv(kd[1], mbs[1])]
+    fs = sz_clamp(fs, copy(mn), copy(mx))
+    var ci2 = mkin(fs[0], fs[1], aw, ah, adef(avw), adef(avh), SZ_CONTENT, AX_BOTH, RUN_PERFORM)
+    let lo = child(t, ch, &ci2)
+    let hm = [m[L], m[R]]
+    let vm = [m[T], m[B]]
+    let hrm = oof_margins(&hm, il, ir, &himc, fs[0], true, rtl)
+    let vrm = oof_margins(&vm, it, ib, &vimc, fs[1], false, false)
+    let x = oof_pos(aw, il, ir, &hm, &hrm, &himc, hsa, hse, hedge, hsafe, hal, js >= SAFE, rtl, fs[0], is_scroll_container(ovx)) + offx
+    let y = oof_pos(ah, it, ib, &vm, &vrm, &vimc, vsa, vse, vedge, vsafe, val, als >= SAFE, false, fs[1], is_scroll_container(ovy)) + offy
+    set_layout(t, ch, x, y, fs[0], fs[1], lo.orr, lo.ob)
+    set_box(t, ch, &cbd, cs.ovx, cs.ovy, cs.sbw)
+    let cx = if rtl then ow - (x + fs[0]) - bor[R] else x - bor[L]
+    let oc = overflow_contrib(cx, y - bor[T], fs[0], fs[1], &lo, &cs, is_scroll_container(ovx) or is_scroll_container(ovy))
+    return oc
 
 fn oof_layout(t: &mut Tree, n: i64, o: &mut Out) bound 4096
     let s = sty(t, n)
+    if s.position == P_STATIC
+        return
     let bor = copy(t.bord[n as usize])
-    let pw = o.w
-    let ins = box_ins(&s, pw)
+    let ins = box_ins(&s, o.w)
     let aw = o.w - hsum(&ins)
     let ah = o.h - vsum(&ins)
-    let pad = rect0(&s.padding, pw)
-    let root = n == 0
-    if not root and s.position == P_STATIC
-        return
     var cands: List[List[f64]] = []
-    oof_collect(t, n, 0.0, 0.0, o.w, o.h, root, &mut cands)
+    oof_collect(t, n, 0.0, 0.0, o.w, o.h, 0, &mut cands)
     for cd in cands
-        let ch = cd[0] as i64
-        let cs = sty(t, ch)
-        let ci0 = 0
-        if true
-            let hsa = cd[1] - ins[L]
-            let hse = cd[2] - ins[L]
-            let hedge = cd[3] as i64
-            let hsafe = cd[4] > 0.5
-            let vsa = cd[5] - ins[T]
-            let vse = cd[6] - ins[T]
-            let vedge = cd[7] as i64
-            let vsafe = cd[8] > 0.5
-            let m = rect_opt(&cs.margin, aw, aw)
-            let cpd = rect0(&cs.padding, aw)
-            let cbd = rect0(&cs.border, aw)
-            let cpb = radd(&cpd, &cbd)
-            let pbs = [hsum(&cpb), vsum(&cpb)]
-            let bsa = if cs.border_box then [0.0, 0.0] else copy(pbs)
-            let il = res(&cs.inset[L], aw)
-            let ir = res(&cs.inset[R], aw)
-            let it = res(&cs.inset[T], ah)
-            let ib = res(&cs.inset[B], ah)
-            let a3 = sz_res(&cs.size, aw, ah)
-            let ssz = sz_add(sz_ratio(a3, cs.ratio), copy(bsa))
-            let a1 = sz_res(&cs.min, aw, ah)
-            var mn = sz_max(sz_or(sz_add(sz_ratio(a1, cs.ratio), copy(bsa)), copy(pbs)), copy(pbs))
-            let a2 = sz_res(&cs.max, aw, ah)
-            let mx = sz_add(sz_ratio(a2, cs.ratio), copy(bsa))
-            var kd = sz_clamp(ssz, copy(mn), copy(mx))
-            var js = if akw(cs.justify_self) != A_NA then cs.justify_self else A_NA
-            let flip = cs.rtl != s.rtl
-            if akw(js) == A_SSTART
-                js = js - A_SSTART + (if flip then A_END else A_START)
-            elif akw(js) == A_SEND
-                js = js - A_SEND + (if flip then A_START else A_END)
-            var als = cs.align_self
-            if akw(als) == A_SSTART
-                als = als - A_SSTART + A_START
-            elif akw(als) == A_SEND
-                als = als - A_SEND + A_END
-            let hal = oof_align(js)
-            let val = oof_align(als)
-            let himc = imcb(aw, il, ir, hsa, hse, hedge, s.rtl)
-            let vimc = imcb(ah, it, ib, vsa, vse, vedge, false)
-            let sfw = fmax(himc[1] - himc[0] - orz(m[L]) - orz(m[R]), 0.0)
-            let sfh = fmax(vimc[1] - vimc[0] - orz(m[T]) - orz(m[B]), 0.0)
-            let avw = mclamp(sfw, mn[0], mx[0])
-            let avh = mclamp(sfh, mn[1], mx[1])
-            let swl = copy(cs.size[0])
-            let shl = copy(cs.size[1])
-            if swl.k >= MINCONT and swl.k <= STRETCH and not has(kd[0])
-                let strw = fmax(aw - orz(il) - orz(ir) - orz(m[L]) - orz(m[R]), 0.0)
-                let r = sizing_kw(&swl, strw, aw)
-                if r[0] == 1.0
-                    kd[0] = r[1]
-                elif r[0] == 2.0
-                    let strh = fmax(ah - orz(it) - orz(ib) - orz(m[T]) - orz(m[B]), 0.0)
-                    kd[0] = measure_axis(t, ch, NO, kd[1], aw, ah, kw_av(r[1]), adef(strh), SZ_CONTENT, 0)
-            if shl.k >= MINCONT and shl.k <= STRETCH and not has(kd[1])
-                let strh = fmax(ah - orz(it) - orz(ib) - orz(m[T]) - orz(m[B]), 0.0)
-                let r = sizing_kw(&shl, strh, ah)
-                if r[0] == 1.0
-                    kd[1] = r[1]
-                elif r[0] == 2.0
-                    let wav = if has(kd[0]) then adef(kd[0]) else adef(avw)
-                    kd[1] = measure_axis(t, ch, kd[0], NO, aw, ah, wav, kw_av(r[1]), SZ_CONTENT, 1)
-            kd = sz_clamp(sz_ratio(kd, cs.ratio), copy(mn), copy(mx))
-            let stw = not has(kd[0]) and has(il) and has(ir) and (hal == 1 or hal == 0)
-            let sth = not has(kd[1]) and has(it) and has(ib) and (val == 1 or val == 0)
-            let sar = if stw and sth and hal == 1 and val == 1 then NO else cs.ratio
-            if stw
-                kd[0] = sfw
-                kd = sz_clamp(sz_ratio(kd, sar), copy(mn), copy(mx))
-            if not has(kd[1]) and sth
-                kd[1] = sfh
-                kd = sz_clamp(sz_ratio(kd, sar), copy(mn), copy(mx))
-            var fs = copy(kd)
-            if not has(kd[0]) or not has(kd[1])
-                let mbs = measure_both(t, ch, kd[0], kd[1], aw, ah, adef(avw), adef(avh), SZ_CONTENT)
-                fs = [orv(kd[0], mbs[0]), orv(kd[1], mbs[1])]
-            fs = sz_clamp(fs, copy(mn), copy(mx))
-            var ci2 = mkin(fs[0], fs[1], aw, ah, adef(avw), adef(avh), SZ_CONTENT, AX_BOTH, RUN_PERFORM)
-            let lo = child(t, ch, &ci2)
-            let hm = [m[L], m[R]]
-            let vm = [m[T], m[B]]
-            let hrm = oof_margins(&hm, il, ir, &himc, fs[0], true, s.rtl)
-            let vrm = oof_margins(&vm, it, ib, &vimc, fs[1], false, false)
-            let x = oof_pos(aw, il, ir, &hm, &hrm, &himc, hsa, hse, hedge, hsafe, hal, js >= SAFE, s.rtl, fs[0], is_scroll_container(s.ovx)) + ins[L]
-            let y = oof_pos(ah, it, ib, &vm, &vrm, &vimc, vsa, vse, vedge, vsafe, val, als >= SAFE, false, fs[1], is_scroll_container(s.ovy)) + ins[T]
-            set_layout(t, ch, x, y, fs[0], fs[1], lo.orr, lo.ob)
-            set_box(t, ch, &cbd, cs.ovx, cs.ovy, cs.sbw)
-            let cx = if s.rtl then o.w - (x + fs[0]) - bor[R] else x - bor[L]
-            let oc = overflow_contrib(cx, y - bor[T], fs[0], fs[1], &lo, &cs, is_scroll_container(s.ovx) or is_scroll_container(s.ovy))
-            let u0 = [o.ol, o.orr, o.ot, o.ob]
-            let u = runion(&u0, &oc)
-            o.ol = u[0]
-            o.orr = u[1]
-            o.ot = u[2]
-            o.ob = u[3]
+        let oc = oof_box(t, cd[0] as i64, &cd, aw, ah, ins[L], ins[T], s.rtl, s.ovx, s.ovy, o.w, &bor)
+        let u0 = [o.ol, o.orr, o.ot, o.ob]
+        let u = runion(&u0, &oc)
+        o.ol = u[0]
+        o.orr = u[1]
+        o.ot = u[2]
+        o.ob = u[3]
