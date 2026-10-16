@@ -1,0 +1,681 @@
+module ml.prob
+# uses: ml.ad, rand.det
+use ml.ad
+use rand.det
+
+# Probabilistic programming with deterministic seeded inference (ml.prob,
+# spec/proposals/ml.md). A model is a log density on unconstrained R^d,
+# written once against the ml.ad tape; inference reads its gradient by the
+# reverse sweep. Every random draw comes from rand.det (ChaCha20, RFC
+# 8439) under a 32-byte seed with one stream per chain, so a run is a
+# function of (model, data, seed, settings) and replays bit for bit.
+#
+# Samplers:
+# - `hmc`: Hamiltonian Monte Carlo (Neal, MCMC using Hamiltonian
+#   dynamics, 2011) with a leapfrog integrator, a diagonal or dense
+#   metric estimated in warmup (Settings.metric 0 or 1), and step size
+#   tuned by dual averaging (Hoffman and Gelman, The No-U-Turn Sampler,
+#   JMLR 2014, Algorithm 5);
+# - `nuts`: the No-U-Turn sampler with multinomial sampling over the
+#   trajectory and the generalised no-U-turn criterion (Betancourt, A
+#   Conceptual Introduction to Hamiltonian Monte Carlo, 2017, A.4), same
+#   adaptation;
+# - `advi`: mean-field Gaussian variational inference (Kucukelbir et al.,
+#   Automatic Differentiation Variational Inference, JMLR 2017) with
+#   reparameterised gradients and Adam.
+# Diagnostics: split R-hat (Gelman et al., BDA3 11.4).
+
+# A model's data; its log density is the function passed beside it,
+# fn(tape, parameter nodes, data) -> (tape, node): it takes the tape by
+# value and returns it with the log density node (a struct cannot hold a
+# function, and emitted targets call a function value without write-back).
+pub struct Model
+    dim: i64
+    data: List[f64]
+
+pub struct Settings
+    warmup: i64
+    draws: i64
+    chains: i64
+    steps: i64
+    delta: f64
+    max_depth: i64
+    metric: i64
+
+pub struct Fit
+    draws: List[List[f64]]
+    accept: List[f64]
+    eps: List[f64]
+    divergent: i64
+
+# ---------------------------------------------------------------- random
+
+# The generator of stream `stream` under a 32-byte seed. A malformed seed
+# gives a generator with no key, whose first draw traps: inference never
+# runs on an unseeded stream.
+pub fn rng(seed: &[i64], stream: i64) -> det.Rng
+    return det.from_seed(seed, stream) catch det.Rng(key: [], stream: 0, block: 0, buf: [], pos: 16)
+
+# A uniform double in (0, 1): 53 random bits, offset by half a step.
+pub fn uniform(r: &mut det.Rng) -> f64
+    let a = det.next_u32(r) >> 5
+    let b = det.next_u32(r) >> 6
+    return ((a as f64) * 67108864.0 + (b as f64) + 0.5) * ad.pow2(-53)
+
+# A standard normal by Box-Muller (one value per pair of uniforms).
+pub fn normal(r: &mut det.Rng) -> f64
+    let u1 = uniform(r)
+    let u2 = uniform(r)
+    return (-2.0 * ad.ln(u1)).sqrt() * ad.cos(6.283185307179586 * u2)
+
+# ---------------------------------------------------------------- density
+
+# Log density and gradient at q.
+pub fn logp_grad(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), q: &[f64]) -> (f64, List[f64])
+    var t = ad.tape()
+    var xs: List[i64] = []
+    for v in q
+        let xi = ad.input(&mut t, v)
+        xs.push(xi)
+    let f = lpf
+    let (t2, o) = f(t, &xs, &m.data)
+    return (ad.value(&t2, o), ad.grad(&t2, o))
+
+# Common log densities on tape nodes (up to additive constants).
+# normal(x | mu, s) with s a constant: -(x - mu)^2 / (2 s^2).
+pub fn lp_normal_c(t: &mut Tape, x: i64, mu: f64, s: f64) -> i64
+    let c = ad.constant(t, mu)
+    let d = ad.sub(t, x, c)
+    let d2 = ad.tpowi(t, d, 2)
+    let k = ad.constant(t, -0.5 / (s * s))
+    return ad.mul(t, k, d2)
+
+# ---------------------------------------------------------------- HMC
+
+# The inverse metric (Euclidean kinetic energy p^T M^-1 p / 2). Diagonal:
+# minv holds M^-1's diagonal. Dense: minv is M^-1 = Sigma (d x d,
+# row-major) and chol its lower Cholesky factor L (Sigma = L L^T).
+pub struct Metric
+    dense: bool
+    dim: i64
+    minv: List[f64]
+    chol: List[f64]
+
+pub fn unit_metric(d: i64, dense: bool) -> Metric
+    var mv: List[f64] = []
+    var ch: List[f64] = []
+    if dense
+        for i in 0..d
+            for j in 0..d
+                mv.push(if i == j then 1.0 else 0.0)
+                ch.push(if i == j then 1.0 else 0.0)
+    else
+        for _ in 0..d
+            mv.push(1.0)
+    return Metric(dense: dense, dim: d, minv: mv, chol: ch)
+
+# Lower Cholesky factor of a symmetric positive definite d x d matrix
+# (Cholesky-Banachiewicz, sums as left folds in index order).
+pub fn cholesky(a: &[f64], d: i64) -> List[f64]
+    var l: List[f64] = []
+    for _ in 0..(d * d)
+        l.push(0.0)
+    for i in 0..d
+        for j in 0..(i + 1)
+            var s = a[(i * d + j) as usize]
+            for k in 0..j
+                s = s - l[(i * d + k) as usize] * l[(j * d + k) as usize]
+            if i == j
+                l[(i * d + i) as usize] = s.sqrt()
+            else
+                l[(i * d + j) as usize] = s / l[(j * d + j) as usize]
+    return l
+
+# M^-1 p.
+fn velocity(mt: &Metric, p: &[f64]) -> List[f64]
+    var v: List[f64] = []
+    let d = mt.dim
+    if not mt.dense
+        for i in 0..p.len()
+            v.push(mt.minv[i] * p[i])
+        return v
+    for i in 0..d
+        var s = 0.0
+        for j in 0..d
+            s = s + mt.minv[(i * d + j) as usize] * p[j as usize]
+        v.push(s)
+    return v
+
+fn kinetic(p: &[f64], mt: &Metric) -> f64
+    var s = 0.0
+    if not mt.dense
+        for i in 0..p.len()
+            s = s + p[i] * p[i] * mt.minv[i]
+        return 0.5 * s
+    let v = velocity(mt, p)
+    for i in 0..p.len()
+        s = s + p[i] * v[i]
+    return 0.5 * s
+
+# A momentum p ~ N(0, M): z / sqrt(minv) (diagonal), or the solution of
+# L^T p = z (dense: Cov(p) = L^-T L^-1 = Sigma^-1 = M).
+fn draw_p(r: &mut det.Rng, mt: &Metric) -> List[f64]
+    let d = mt.dim
+    var z: List[f64] = []
+    for _ in 0..d
+        let x = normal(r)
+        z.push(x)
+    var p: List[f64] = []
+    if not mt.dense
+        for i in 0..d
+            p.push(z[i as usize] / mt.minv[i as usize].sqrt())
+        return p
+    for _ in 0..d
+        p.push(0.0)
+    var i = d - 1
+    while i >= 0 bound 1099511627776
+        var s = z[i as usize]
+        for k in (i + 1)..d
+            s = s - mt.chol[(k * d + i) as usize] * p[k as usize]
+        p[i as usize] = s / mt.chol[(i * d + i) as usize]
+        i -= 1
+    return p
+
+# One leapfrog step (half momentum, full position, half momentum).
+fn leapfrog(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), q: &mut List[f64], p: &mut List[f64], g: &mut List[f64], eps: f64, mt: &Metric) -> f64
+    for i in 0..q.len()
+        p[i] = p[i] + 0.5 * eps * g[i]
+    if mt.dense
+        let v = velocity(mt, p)
+        for i in 0..q.len()
+            q[i] = q[i] + eps * v[i]
+    else
+        for i in 0..q.len()
+            q[i] = q[i] + eps * mt.minv[i] * p[i]
+    let (lp, g2) = logp_grad(m, lpf, q)
+    for i in 0..q.len()
+        g[i] = g2[i]
+        p[i] = p[i] + 0.5 * eps * g[i]
+    return lp
+
+# DualAvg averaging state (Hoffman and Gelman 2014, eq. 6; gamma 0.05,
+# t0 10, kappa 0.75, mu = ln(10 eps0)).
+pub struct DualAvg
+    mu: f64
+    hbar: f64
+    lxbar: f64
+    n: i64
+
+fn da_new(eps: f64) -> DualAvg = DualAvg(mu: ad.ln(10.0 * eps), hbar: 0.0, lxbar: 0.0, n: 0)
+
+fn da_step(d: &mut DualAvg, accept: f64, delta: f64) -> f64
+    d.n += 1
+    let n = d.n as f64
+    let w = 1.0 / (n + 10.0)
+    d.hbar = (1.0 - w) * d.hbar + w * (delta - accept)
+    let lx = d.mu - (n.sqrt() / 0.05) * d.hbar
+    let eta = ad.exp(-0.75 * ad.ln(n))
+    d.lxbar = eta * lx + (1.0 - eta) * d.lxbar
+    return ad.exp(lx)
+
+fn da_final(d: &DualAvg) -> f64 = ad.exp(d.lxbar)
+
+fn finite_ok(x: f64) -> bool = x > -1.0e300 and x < 1.0e300
+
+# The energy of a state; a trajectory whose energy error exceeds 1000 is
+# divergent (Stan's threshold).
+fn energy(lp: f64, p: &[f64], mt: &Metric) -> f64 = kinetic(p, mt) - lp
+
+# Static HMC transition: L leapfrog steps, Metropolis accept.
+fn hmc_step(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), r: &mut det.Rng, q: &List[f64], lp: f64, g: &List[f64], eps: f64, steps: i64, mt: &Metric) -> (List[f64], f64, List[f64], f64, bool)
+    var p = draw_p(r, mt)
+    let h0 = energy(lp, &p, mt)
+    var q1 = copy(q)
+    var g1 = copy(g)
+    var lp1 = lp
+    var dv = false
+    for _ in 0..steps
+        lp1 = leapfrog(m, lpf, &mut q1, &mut p, &mut g1, eps, mt)
+        if energy(lp1, &p, mt) - h0 > 1000.0
+            dv = true
+            break
+    let e1 = energy(lp1, &p, mt)
+    let h1 = if dv then h0 + 1000.0 else e1
+    let a = if h0 - h1 >= 0.0 then 1.0 else ad.exp(h0 - h1)
+    let u = uniform(r)
+    if not dv and u < a
+        return (q1, lp1, g1, a, false)
+    return (copy(q), lp, copy(g), if dv then 0.0 else a, dv)
+
+# ---------------------------------------------------------------- NUTS
+
+# A subtree: its leftmost and rightmost states (position, momentum,
+# gradient), the multinomial proposal with its log weight, the momentum
+# sum (for the generalised criterion), accept statistics.
+pub struct Tree
+    ql: List[f64]
+    pl: List[f64]
+    gl: List[f64]
+    qr: List[f64]
+    pr: List[f64]
+    gr: List[f64]
+    qp: List[f64]
+    lpp: f64
+    gp: List[f64]
+    lw: f64
+    rho: List[f64]
+    stop: bool
+    dv: bool
+    asum: f64
+    n: i64
+
+fn empty_tree() -> Tree = Tree(ql: [], pl: [], gl: [], qr: [], pr: [], gr: [], qp: [], lpp: 0.0, gp: [], lw: 0.0, rho: [], stop: true, dv: false, asum: 0.0, n: 0)
+
+fn log_add(a: f64, b: f64) -> f64
+    if a > b
+        return a + ad.log1p(ad.exp(b - a))
+    return b + ad.log1p(ad.exp(a - b))
+
+fn vadd(a: &[f64], b: &[f64]) -> List[f64]
+    var r: List[f64] = []
+    for i in 0..a.len()
+        r.push(a[i] + b[i])
+    return r
+
+# No-U-turn: rho . (M^-1 p) > 0 at both ends.
+fn uturn_ok(rho: &[f64], pl: &[f64], pr: &[f64], mt: &Metric) -> bool
+    var a = 0.0
+    var b = 0.0
+    if mt.dense
+        let vl = velocity(mt, pl)
+        let vr = velocity(mt, pr)
+        for i in 0..rho.len()
+            a = a + rho[i] * vl[i]
+            b = b + rho[i] * vr[i]
+    else
+        for i in 0..rho.len()
+            a = a + rho[i] * mt.minv[i] * pl[i]
+            b = b + rho[i] * mt.minv[i] * pr[i]
+    return a > 0.0 and b > 0.0
+
+# Build a subtree of 2^depth leapfrog steps in direction dir from (q, p, g).
+fn build(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), r: &mut det.Rng, q: &[f64], p: &[f64], g: &[f64], dir: f64, depth: i64, eps: f64, h0: f64, mt: &Metric) -> Tree bound 16
+    if depth == 0
+        var q1 = copy(q)
+        var p1 = copy(p)
+        var g1 = copy(g)
+        let lp1 = leapfrog(m, lpf, &mut q1, &mut p1, &mut g1, dir * eps, mt)
+        let h = energy(lp1, &p1, mt)
+        let dv = h - h0 > 1000.0
+        let acc = if h0 - h >= 0.0 then 1.0 else ad.exp(h0 - h)
+        return Tree(ql: copy(q1), pl: copy(p1), gl: copy(g1), qr: copy(q1), pr: copy(p1), gr: copy(g1), qp: copy(q1), lpp: lp1, gp: copy(g1), lw: h0 - h, rho: copy(p1), stop: dv, dv: dv, asum: if dv then 0.0 else acc, n: 1)
+    let t1 = build(m, lpf, r, q, p, g, dir, depth - 1, eps, h0, mt)
+    if t1.stop
+        return t1
+    let q0 = if dir > 0.0 then copy(t1.qr) else copy(t1.ql)
+    let p0 = if dir > 0.0 then copy(t1.pr) else copy(t1.pl)
+    let g0 = if dir > 0.0 then copy(t1.gr) else copy(t1.gl)
+    let t2 = build(m, lpf, r, &q0, &p0, &g0, dir, depth - 1, eps, h0, mt)
+    var t = copy(t1)
+    if dir > 0.0
+        t.qr = copy(t2.qr)
+        t.pr = copy(t2.pr)
+        t.gr = copy(t2.gr)
+    else
+        t.ql = copy(t2.ql)
+        t.pl = copy(t2.pl)
+        t.gl = copy(t2.gl)
+    t.asum = t1.asum + t2.asum
+    t.n = t1.n + t2.n
+    if t2.stop
+        t.stop = true
+        t.dv = t2.dv
+        return t
+    let lw = log_add(t1.lw, t2.lw)
+    # multinomial: take the second subtree's proposal with probability w2 / (w1 + w2)
+    let um = uniform(r)
+    if um < ad.exp(t2.lw - lw)
+        t.qp = copy(t2.qp)
+        t.lpp = t2.lpp
+        t.gp = copy(t2.gp)
+    t.lw = lw
+    t.rho = vadd(&t1.rho, &t2.rho)
+    t.stop = not uturn_ok(&t.rho, &t.pl, &t.pr, mt)
+    return t
+
+fn nuts_step(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), r: &mut det.Rng, q: &List[f64], lp: f64, g: &List[f64], eps: f64, max_depth: i64, mt: &Metric) -> (List[f64], f64, List[f64], f64, bool)
+    var p = draw_p(r, mt)
+    let h0 = energy(lp, &p, mt)
+    var ql = copy(q)
+    var pl = copy(p)
+    var gl = copy(g)
+    var qr = copy(q)
+    var pr = copy(p)
+    var gr = copy(g)
+    var qs = copy(q)
+    var lps = lp
+    var gs = copy(g)
+    var lw = 0.0
+    var rho = copy(p)
+    var asum = 0.0
+    var n = 0
+    var dv = false
+    var depth = 0
+    while depth < max_depth bound 16
+        let ud = uniform(r)
+        let dir = if ud < 0.5 then -1.0 else 1.0
+        var t = empty_tree()
+        if dir > 0.0
+            t = build(m, lpf, r, &qr, &pr, &gr, dir, depth, eps, h0, mt)
+        else
+            t = build(m, lpf, r, &ql, &pl, &gl, dir, depth, eps, h0, mt)
+        asum = asum + t.asum
+        n = n + t.n
+        if t.stop
+            dv = t.dv
+            break
+        if dir > 0.0
+            qr = copy(t.qr)
+            pr = copy(t.pr)
+            gr = copy(t.gr)
+        else
+            ql = copy(t.ql)
+            pl = copy(t.pl)
+            gl = copy(t.gl)
+        # biased progressive sampling: move to the new subtree with
+        # probability min(1, w_new / w_old)
+        let us = uniform(r)
+        if t.lw - lw >= 0.0 or us < ad.exp(t.lw - lw)
+            qs = copy(t.qp)
+            lps = t.lpp
+            gs = copy(t.gp)
+        lw = log_add(lw, t.lw)
+        rho = vadd(&rho, &t.rho)
+        depth += 1
+        if not uturn_ok(&rho, &pl, &pr, mt)
+            break
+    let acc = if n > 0 then asum / (n as f64) else 0.0
+    return (qs, lps, gs, acc, dv)
+
+# ---------------------------------------------------------------- driver
+
+# A heuristic first step size (Hoffman and Gelman 2014, Algorithm 4).
+fn init_eps(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), r: &mut det.Rng, q: &List[f64], lp: f64, g: &List[f64], mt: &Metric) -> f64
+    var eps = 1.0
+    var p = draw_p(r, mt)
+    let h0 = energy(lp, &p, mt)
+    var q1 = copy(q)
+    var p1 = copy(p)
+    var g1 = copy(g)
+    var lp1 = leapfrog(m, lpf, &mut q1, &mut p1, &mut g1, eps, mt)
+    let e1 = energy(lp1, &p1, mt)
+    let dirn = if h0 - e1 > -0.6931471805599453 then 1.0 else -1.0
+    var k = 0
+    while k < 60 bound 64
+        let dh = h0 - energy(lp1, &p1, mt)
+        if dirn > 0.0 and dh <= -0.6931471805599453
+            break
+        if dirn < 0.0 and dh > -0.6931471805599453
+            break
+        eps = if dirn > 0.0 then eps * 2.0 else eps * 0.5
+        q1 = copy(q)
+        p1 = copy(p)
+        g1 = copy(g)
+        lp1 = leapfrog(m, lpf, &mut q1, &mut p1, &mut g1, eps, mt)
+        k += 1
+    return eps
+
+# Run `s.chains` chains from q0, chain c on rand.det stream c. sampler: 0
+# static HMC (s.steps leapfrog steps), 1 NUTS (depth up to s.max_depth).
+# Warmup: step size by dual averaging throughout; the metric is the
+# regularised variance (diagonal) or covariance (dense, Welford's update
+# for the co-moments) of warmup draws in [w/4, 3w/4), shrunk toward
+# 1e-3 I as in Stan, after which the step size search restarts.
+pub fn sample(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), q0: &[f64], seed: &[i64], s: &Settings, sampler: i64) -> Fit
+    var draws: List[List[f64]] = []
+    var accs: List[f64] = []
+    var epss: List[f64] = []
+    var ndiv = 0
+    for c in 0..s.chains
+        var r = rng(seed, c)
+        var q = copy(q0)
+        let d = q.len()
+        let dense = s.metric == 1
+        var mt = unit_metric(d as i64, dense)
+        let (lp0, g0) = logp_grad(m, lpf, &q)
+        var lp = lp0
+        var g = g0
+        var eps = init_eps(m, lpf, &mut r, &q, lp, &g, &mt)
+        var da = da_new(eps)
+        let w1 = s.warmup / 4
+        let w2 = (3 * s.warmup) / 4
+        var wn = 0
+        var wmean: List[f64] = []
+        var wm2: List[f64] = []
+        for _ in 0..d
+            wmean.push(0.0)
+        let ncov = if dense then d * d else d
+        for _ in 0..ncov
+            wm2.push(0.0)
+        var asum = 0.0
+        for it in 0..(s.warmup + s.draws)
+            var a = 0.0
+            var dv = false
+            if sampler == 0
+                let (q1, lp1, g1, a1, dv1) = hmc_step(m, lpf, &mut r, &q, lp, &g, eps, s.steps, &mt)
+                q = q1
+                lp = lp1
+                g = g1
+                a = a1
+                dv = dv1
+            else
+                let (q1, lp1, g1, a1, dv1) = nuts_step(m, lpf, &mut r, &q, lp, &g, eps, s.max_depth, &mt)
+                q = q1
+                lp = lp1
+                g = g1
+                a = a1
+                dv = dv1
+            if it < s.warmup
+                eps = da_step(&mut da, a, s.delta)
+                if it >= w1 and it < w2
+                    wn += 1
+                    var dls: List[f64] = []
+                    for i in 0..d
+                        let dl = q[i] - wmean[i]
+                        dls.push(dl)
+                        wmean[i] = wmean[i] + dl / (wn as f64)
+                    if dense
+                        for i in 0..d
+                            for j in 0..d
+                                wm2[i * d + j] = wm2[i * d + j] + dls[i] * (q[j] - wmean[j])
+                    else
+                        for i in 0..d
+                            wm2[i] = wm2[i] + dls[i] * (q[i] - wmean[i])
+                if it == w2 - 1 and wn > 2
+                    let nn = wn as f64
+                    if dense
+                        var sg: List[f64] = []
+                        for i in 0..d
+                            for j in 0..d
+                                let c = (nn / (nn + 5.0)) * (wm2[i * d + j] / (nn - 1.0))
+                                sg.push(if i == j then c + 0.001 * (5.0 / (nn + 5.0)) else c)
+                        let ch = cholesky(&sg, d as i64)
+                        mt = Metric(dense: true, dim: d as i64, minv: sg, chol: ch)
+                    else
+                        for i in 0..d
+                            mt.minv[i] = (nn / (nn + 5.0)) * (wm2[i] / (nn - 1.0)) + 0.001 * (5.0 / (nn + 5.0))
+                    eps = init_eps(m, lpf, &mut r, &q, lp, &g, &mt)
+                    da = da_new(eps)
+                if it == s.warmup - 1
+                    eps = da_final(&da)
+            else
+                draws.push(copy(q))
+                asum = asum + a
+                if dv
+                    ndiv += 1
+        accs.push(asum / (s.draws as f64))
+        epss.push(eps)
+    return Fit(draws: draws, accept: accs, eps: epss, divergent: ndiv)
+
+# ---------------------------------------------------------------- summaries
+
+# Column j of the draws, all chains in order.
+pub fn column(f: &Fit, j: i64) -> List[f64]
+    var c: List[f64] = []
+    for d in f.draws
+        c.push(d[j as usize])
+    return c
+
+pub fn mean_of(xs: &[f64]) -> f64
+    var s = 0.0
+    for x in xs
+        s = s + x
+    return s / (xs.len() as f64)
+
+pub fn sd_of(xs: &[f64]) -> f64
+    let mu = mean_of(xs)
+    var s = 0.0
+    for x in xs
+        s = s + (x - mu) * (x - mu)
+    return (s / ((xs.len() as f64) - 1.0)).sqrt()
+
+# Split R-hat of a column over `chains` equal chains (each split in two).
+pub fn split_rhat(xs: &[f64], chains: i64) -> f64
+    let n = (xs.len() as i64) / chains
+    let h = n / 2
+    var ms: List[f64] = []
+    var vs: List[f64] = []
+    for c in 0..(2 * chains)
+        var part: List[f64] = []
+        for i in 0..h
+            part.push(xs[(c * h + i + (c / 2) * (n - 2 * h)) as usize])
+        ms.push(mean_of(&part))
+        let sd = sd_of(&part)
+        vs.push(sd * sd)
+    let hh = h as f64
+    let w = mean_of(&vs)
+    let mm = sd_of(&ms)
+    let b = hh * mm * mm
+    let vhat = ((hh - 1.0) / hh) * w + b / hh
+    return (vhat / w).sqrt()
+
+# Autocovariance of one chain's segment at lag k (divided by n).
+fn acov(xs: &[f64], off: i64, n: i64, mu: f64, k: i64) -> f64
+    var s = 0.0
+    for i in 0..(n - k)
+        s = s + (xs[(off + i) as usize] - mu) * (xs[(off + i + k) as usize] - mu)
+    return s / (n as f64)
+
+# Effective sample size of a column over `chains` equal chains: BDA3
+# 11.5 (rho_t = 1 - (W - mean acov_t) / var+), summed with Geyer's initial
+# monotone sequence of pair sums. Capped at chains * n * log10(chains * n)
+# as in Stan.
+pub fn ess(xs: &[f64], chains: i64) -> f64
+    let n = (xs.len() as i64) / chains
+    var mus: List[f64] = []
+    var w = 0.0
+    for c in 0..chains
+        var part: List[f64] = []
+        for i in 0..n
+            part.push(xs[(c * n + i) as usize])
+        let mu = mean_of(&part)
+        mus.push(mu)
+        let sd = sd_of(&part)
+        w = w + sd * sd
+    w = w / (chains as f64)
+    let nn = n as f64
+    let bsd = sd_of(&mus)
+    let vplus = ((nn - 1.0) / nn) * w + bsd * bsd
+    var tau = -1.0
+    var prev = 1.0e300
+    var k = 0
+    while k + 1 < n bound 1099511627776
+        var a0 = 0.0
+        var a1 = 0.0
+        for c in 0..chains
+            a0 = a0 + acov(xs, c * n, n, mus[c as usize], k)
+            a1 = a1 + acov(xs, c * n, n, mus[c as usize], k + 1)
+        let cf = chains as f64
+        let r0 = 1.0 - (w - a0 / cf * (nn / (nn - 1.0))) / vplus
+        let r1 = 1.0 - (w - a1 / cf * (nn / (nn - 1.0))) / vplus
+        var pk = r0 + r1
+        if pk <= 0.0
+            break
+        if pk > prev
+            pk = prev
+        prev = pk
+        tau = tau + 2.0 * pk
+        k += 2
+    let tot = (chains * n) as f64
+    let cap = tot * ad.ln(tot) / 2.302585092994046
+    let e = tot / tau
+    return if e > cap then cap else e
+
+# ---------------------------------------------------------------- ADVI
+
+pub struct Advi
+    mu: List[f64]
+    omega: List[f64]
+    elbo: List[f64]
+
+# Mean-field ADVI: q(z) = N(mu, diag(exp(omega))^2). Each step draws
+# `mc` standard normals per coordinate, forms z = mu + exp(omega) e on the
+# tape, and ascends the ELBO estimate logp(z) + sum(omega) with Adam
+# (b1 0.9, b2 0.999, eps 1e-8). Initial omega = 0.
+pub fn advi(m: &Model, lpf: fn(ad.Tape, &[i64], &[f64]) -> (ad.Tape, i64), mu0: &[f64], seed: &[i64], steps: i64, mc: i64, lr: f64) -> Advi
+    var r = rng(seed, 0)
+    let d = mu0.len()
+    var mu = copy(mu0)
+    var om: List[f64] = []
+    var m1: List[f64] = []
+    var v1: List[f64] = []
+    for _ in 0..(2 * d)
+        m1.push(0.0)
+        v1.push(0.0)
+    for _ in 0..d
+        om.push(0.0)
+    var trace: List[f64] = []
+    for it in 0..steps
+        var gsum: List[f64] = []
+        for _ in 0..(2 * d)
+            gsum.push(0.0)
+        var esum = 0.0
+        for _ in 0..mc
+            var t = ad.tape()
+            var zs: List[i64] = []
+            var oms: List[i64] = []
+            for i in 0..d
+                let mi = ad.input(&mut t, mu[i])
+                let oi = ad.input(&mut t, om[i])
+                let z = normal(&mut r)
+                let e = ad.constant(&mut t, z)
+                let s = ad.texp(&mut t, oi)
+                let se = ad.mul(&mut t, s, e)
+                let zi = ad.add(&mut t, mi, se)
+                zs.push(zi)
+                oms.push(oi)
+            let f = lpf
+            let (t2, lpz) = f(t, &zs, &m.data)
+            var t3 = t2
+            var acc = lpz
+            for o in oms
+                acc = ad.add(&mut t3, acc, o)
+            esum = esum + ad.value(&t3, acc)
+            let g = ad.grad(&t3, acc)
+            for i in 0..(2 * d)
+                gsum[i] = gsum[i] + g[i]
+        trace.push(esum / (mc as f64))
+        let k = (it + 1) as i64
+        let bc1 = 1.0 - ad.powi(0.9, k)
+        let bc2 = 1.0 - ad.powi(0.999, k)
+        for j in 0..(2 * d)
+            let gj = gsum[j] / (mc as f64)
+            m1[j] = 0.9 * m1[j] + 0.1 * gj
+            v1[j] = 0.999 * v1[j] + 0.001 * gj * gj
+            let stp = lr * (m1[j] / bc1) / ((v1[j] / bc2).sqrt() + 1.0e-8)
+            let i = j / 2
+            if j % 2 == 0
+                mu[i] = mu[i] + stp
+            else
+                om[i] = om[i] + stp
+    return Advi(mu: mu, omega: om, elbo: trace)

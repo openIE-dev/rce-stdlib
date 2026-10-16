@@ -21,9 +21,15 @@ out += [l for l in body if l.startswith('#!')]
 aliases = []
 for d in deps:
     src = open(os.path.join(root, 'lib', d + '.rce')).read().split('\n')
-    name = src[0].split()[1]
+    # a dependency may start with '# rce-version: V' before its module line
+    # (rand.det does, for Cap); the version line moves to the top
+    mi = next(i for i, l in enumerate(src) if l.startswith('module '))
+    for l in src[:mi]:
+        if l.startswith('# rce-version:') and not out[0].startswith('# rce-version:'):
+            out.insert(0, l)
+    name = src[mi].split()[1]
     aliases.append(name.split('.')[-1])
-    out += [l for l in src[1:] if not l.startswith('#!')]
+    out += [l for l in src[mi + 1:] if not l.startswith('#!')]
 for l in body:
     if l.startswith('#!') or re.match(r'^use ', l):
         continue

@@ -60,3 +60,11 @@ for p in tests/*/*_probes.py; do
   RCE="$RCE" python3 "$p" | tail -1
   RCE="$RCE" python3 "$p" > /dev/null || { echo "FAIL probes $p"; exit 1; }
 done
+# Emitted targets (spec 10.5): the first checks file of each lib/ml module
+# is emitted to Python and JavaScript; every observation must be true and
+# the observation lines identical across targets (the checks compare
+# floats bit for bit). The other ml checks files, Rust, and the inference
+# runs of tests/*/*_emit.rce are in scripts/nightly.sh.
+for m in ad tensor prob; do
+  RCE="$RCE" python3 scripts/emitgate.py targets "lib/ml/$m.rce" "tests/ml/${m}_checks.rce" python js
+done

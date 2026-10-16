@@ -1,0 +1,241 @@
+
+# ---- posteriordb models (posterior_database/models/stan at stan-dev/
+# posteriordb 91027f9), unconstrained as Stan does (log for lower=0,
+# logit for (0, 1), with the log Jacobian), log densities up to a constant.
+
+# Rate_1_model: theta ~ beta(1, 1); k ~ binomial(n, theta). x = [logit theta];
+# data [n, k].
+fn rate1(t0: ad.Tape, x: &[i64], d: &[f64]) -> (ad.Tape, i64)
+    var t = t0
+    let nu = ad.neg(&mut t, x[0])
+    let a = ad.tsoftplus(&mut t, nu)
+    let b = ad.tsoftplus(&mut t, x[0])
+    let ca = ad.constant(&mut t, 0.0 - (d[1] + 1.0))
+    let cb = ad.constant(&mut t, 0.0 - (d[0] - d[1] + 1.0))
+    let la = ad.mul(&mut t, ca, a)
+    let lb = ad.mul(&mut t, cb, b)
+    let r = ad.add(&mut t, la, lb)
+    return (t, r)
+
+fn rate1_out(q: &[f64]) -> List[f64] = [ad.sigmoid(q[0])]
+
+# eight_schools_noncentered: x = [theta_trans[1..8], mu, log tau];
+# data [J, y[1..J], sigma[1..J]].
+fn eight(t0: ad.Tape, x: &[i64], d: &[f64]) -> (ad.Tape, i64)
+    var t = t0
+    let j = d[0] as i64
+    let tau = ad.texp(&mut t, x[(j + 1) as usize])
+    var acc = x[(j + 1) as usize]
+    for i in 0..j
+        let a = lp_normal_c(&mut t, x[i as usize], 0.0, 1.0)
+        acc = ad.add(&mut t, acc, a)
+        let st = ad.mul(&mut t, x[i as usize], tau)
+        let th = ad.add(&mut t, st, x[j as usize])
+        let b = lp_normal_c(&mut t, th, d[(1 + i) as usize], d[(1 + j + i) as usize])
+        acc = ad.add(&mut t, acc, b)
+    let pm = lp_normal_c(&mut t, x[j as usize], 0.0, 5.0)
+    acc = ad.add(&mut t, acc, pm)
+    # tau ~ cauchy(0, 5): -log(1 + (tau / 5)^2)
+    let c5 = ad.constant(&mut t, 0.2)
+    let ts = ad.mul(&mut t, tau, c5)
+    let t2 = ad.tpowi(&mut t, ts, 2)
+    let l1 = ad.tlog1p(&mut t, t2)
+    let r = ad.sub(&mut t, acc, l1)
+    return (t, r)
+
+fn eight_out(q: &[f64]) -> List[f64]
+    let tau = ad.exp(q[9])
+    var o: List[f64] = []
+    for i in 0..8
+        o.push(q[i] * tau + q[8])
+    o.push(q[8])
+    o.push(tau)
+    return o
+
+# Sufficient statistics [N, Sy, Sx, Syy, Sxy, Sxx] of (y, x), left folds.
+fn suff2(y: &[f64], x: &[f64]) -> List[f64]
+    var sy = 0.0
+    var sx = 0.0
+    var syy = 0.0
+    var sxy = 0.0
+    var sxx = 0.0
+    for i in 0..y.len()
+        sy = sy + y[i]
+        sx = sx + x[i]
+        syy = syy + y[i] * y[i]
+        sxy = sxy + x[i] * y[i]
+        sxx = sxx + x[i] * x[i]
+    return [y.len() as f64, sy, sx, syy, sxy, sxx]
+
+# kidscore_momiq: kid_score ~ normal(b1 + b2 mom_iq, sigma), sigma ~
+# cauchy(0, 2.5). x = [b1, b2, log sigma]; data = suff2(kid_score, mom_iq).
+fn kid(t0: ad.Tape, x: &[i64], d: &[f64]) -> (ad.Tape, i64)
+    var t = t0
+    let b1 = x[0]
+    let b2 = x[1]
+    let v = x[2]
+    # RSS = Syy - 2 b1 Sy - 2 b2 Sxy + N b1^2 + 2 b1 b2 Sx + b2^2 Sxx
+    let c_syy = ad.constant(&mut t, d[3])
+    let c_sy = ad.constant(&mut t, -2.0 * d[1])
+    let c_sxy = ad.constant(&mut t, -2.0 * d[4])
+    let c_n = ad.constant(&mut t, d[0])
+    let c_sx = ad.constant(&mut t, 2.0 * d[2])
+    let c_sxx = ad.constant(&mut t, d[5])
+    let t1 = ad.mul(&mut t, c_sy, b1)
+    let t2 = ad.mul(&mut t, c_sxy, b2)
+    let b1s = ad.tpowi(&mut t, b1, 2)
+    let t3 = ad.mul(&mut t, c_n, b1s)
+    let b12 = ad.mul(&mut t, b1, b2)
+    let t4 = ad.mul(&mut t, c_sx, b12)
+    let b2s = ad.tpowi(&mut t, b2, 2)
+    let t5 = ad.mul(&mut t, c_sxx, b2s)
+    let s1 = ad.add(&mut t, c_syy, t1)
+    let s2 = ad.add(&mut t, s1, t2)
+    let s3 = ad.add(&mut t, s2, t3)
+    let s4 = ad.add(&mut t, s3, t4)
+    let rss = ad.add(&mut t, s4, t5)
+    let m2 = ad.constant(&mut t, -2.0)
+    let mv = ad.mul(&mut t, m2, v)
+    let iv = ad.texp(&mut t, mv)
+    let q = ad.mul(&mut t, rss, iv)
+    let mh = ad.constant(&mut t, -0.5)
+    let ll = ad.mul(&mut t, mh, q)
+    let cn = ad.constant(&mut t, 1.0 - d[0])
+    let nv = ad.mul(&mut t, cn, v)
+    let a1 = ad.add(&mut t, ll, nv)
+    let sg = ad.texp(&mut t, v)
+    let c25 = ad.constant(&mut t, 0.4)
+    let ss = ad.mul(&mut t, sg, c25)
+    let ss2 = ad.tpowi(&mut t, ss, 2)
+    let lc = ad.tlog1p(&mut t, ss2)
+    let r = ad.sub(&mut t, a1, lc)
+    return (t, r)
+
+fn kid_out(q: &[f64]) -> List[f64] = [q[0], q[1], ad.exp(q[2])]
+
+# blr: beta ~ normal(0, 10), sigma ~ normal+(0, 10), y ~ normal(X beta,
+# sigma). x = [beta[1..D], log sigma]. The residual sum of squares is
+# written about the least-squares solution b (X'X b = X'y by Cholesky):
+# RSS(beta) = RSS(b) + (beta - b)' X'X (beta - b), exact in real
+# arithmetic and free of the cancellation of y'y - 2 beta'X'y + ...;
+# data [N, D, RSS(b), b[1..D], X'X[1..D, 1..D] row-major] from blr_stats.
+fn blr_stats(n: i64, dd: i64, xm: &[f64], y: &[f64]) -> List[f64]
+    var xtx: List[f64] = []
+    var xty: List[f64] = []
+    for j in 0..dd
+        var s = 0.0
+        for i in 0..n
+            s = s + xm[(i * dd + j) as usize] * y[i as usize]
+        xty.push(s)
+        for k in 0..dd
+            var u = 0.0
+            for i in 0..n
+                u = u + xm[(i * dd + j) as usize] * xm[(i * dd + k) as usize]
+            xtx.push(u)
+    # Cholesky X'X = L L', then L z = X'y, L' b = z
+    var l: List[f64] = []
+    for _ in 0..(dd * dd)
+        l.push(0.0)
+    for j in 0..dd
+        var s = xtx[(j * dd + j) as usize]
+        for k in 0..j
+            s = s - l[(j * dd + k) as usize] * l[(j * dd + k) as usize]
+        let ljj = s.sqrt()
+        l[(j * dd + j) as usize] = ljj
+        for i in (j + 1)..dd
+            var u = xtx[(i * dd + j) as usize]
+            for k in 0..j
+                u = u - l[(i * dd + k) as usize] * l[(j * dd + k) as usize]
+            l[(i * dd + j) as usize] = u / ljj
+    var z: List[f64] = []
+    for i in 0..dd
+        var s = xty[i as usize]
+        for k in 0..i
+            s = s - l[(i * dd + k) as usize] * z[k as usize]
+        z.push(s / l[(i * dd + i) as usize])
+    var b: List[f64] = []
+    for _ in 0..dd
+        b.push(0.0)
+    var i = dd - 1
+    while i >= 0 bound 1099511627776
+        var s = z[i as usize]
+        for k in (i + 1)..dd
+            s = s - l[(k * dd + i) as usize] * b[k as usize]
+        b[i as usize] = s / l[(i * dd + i) as usize]
+        i -= 1
+    var rss = 0.0
+    for r in 0..n
+        var f = 0.0
+        for j in 0..dd
+            f = f + xm[(r * dd + j) as usize] * b[j as usize]
+        let e = y[r as usize] - f
+        rss = rss + e * e
+    var o: List[f64] = [n as f64, dd as f64, rss]
+    for v in b
+        o.push(v)
+    for v in xtx
+        o.push(v)
+    return o
+
+fn blr(t0: ad.Tape, x: &[i64], d: &[f64]) -> (ad.Tape, i64)
+    var t = t0
+    let n = d[0]
+    let dd = d[1] as i64
+    let v = x[dd as usize]
+    var rss = ad.constant(&mut t, d[2])
+    var prior = ad.constant(&mut t, 0.0)
+    var dl: List[i64] = []
+    for j in 0..dd
+        let c = ad.constant(&mut t, d[(3 + j) as usize])
+        let dj = ad.sub(&mut t, x[j as usize], c)
+        dl.push(dj)
+        let pj = lp_normal_c(&mut t, x[j as usize], 0.0, 10.0)
+        prior = ad.add(&mut t, prior, pj)
+    for j in 0..dd
+        for k in 0..dd
+            let c = ad.constant(&mut t, d[(3 + dd + j * dd + k) as usize])
+            let bb = ad.mul(&mut t, dl[j as usize], dl[k as usize])
+            let a = ad.mul(&mut t, c, bb)
+            rss = ad.add(&mut t, rss, a)
+    let m2 = ad.constant(&mut t, -2.0)
+    let mv = ad.mul(&mut t, m2, v)
+    let iv = ad.texp(&mut t, mv)
+    let q = ad.mul(&mut t, rss, iv)
+    let mh = ad.constant(&mut t, -0.5)
+    let ll = ad.mul(&mut t, mh, q)
+    let cn = ad.constant(&mut t, 1.0 - n)
+    let nv = ad.mul(&mut t, cn, v)
+    let a1 = ad.add(&mut t, ll, nv)
+    let sg = ad.texp(&mut t, v)
+    let ps = lp_normal_c(&mut t, sg, 0.0, 10.0)
+    let a2 = ad.add(&mut t, a1, ps)
+    let r = ad.add(&mut t, a2, prior)
+    return (t, r)
+
+fn blr_out(q: &[f64]) -> List[f64]
+    var o: List[f64] = []
+    for j in 0..(q.len() - 1)
+        o.push(q[j])
+    o.push(ad.exp(q[q.len() - 1]))
+    return o
+
+# A correlated Gaussian (analytic reference, for the dense metric): x ~
+# N(0, S), S = [[s0^2, rho s0 s1], [rho s0 s1, s1^2]]; data [rho, s0, s1].
+fn corr2(t0: ad.Tape, x: &[i64], d: &[f64]) -> (ad.Tape, i64)
+    var t = t0
+    let c0 = ad.constant(&mut t, d[1])
+    let c1 = ad.constant(&mut t, d[2])
+    let u = ad.div(&mut t, x[0], c0)
+    let v = ad.div(&mut t, x[1], c1)
+    let uu = ad.mul(&mut t, u, u)
+    let vv = ad.mul(&mut t, v, v)
+    let uv = ad.mul(&mut t, u, v)
+    let cr = ad.constant(&mut t, 2.0 * d[0])
+    let cuv = ad.mul(&mut t, cr, uv)
+    let s1 = ad.sub(&mut t, uu, cuv)
+    let s2 = ad.add(&mut t, s1, vv)
+    let ck = ad.constant(&mut t, -0.5 / (1.0 - d[0] * d[0]))
+    let r = ad.mul(&mut t, ck, s2)
+    return (t, r)
+
+fn corr2_out(q: &[f64]) -> List[f64] = [q[0], q[1]]
