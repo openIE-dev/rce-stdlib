@@ -1,0 +1,483 @@
+module ui.layout
+
+# CSS layout (survey M50), pure: block (with floats and margin collapsing),
+# flexbox and grid, positioned boxes, and the rounding pass. The algorithm
+# follows Taffy (DioxusLabs/taffy, MIT), whose 6,504 fixtures carry layouts
+# measured in Chrome; tests/ui/layout_checks_*.rce replay all of them.
+# Lengths are f64 CSS pixels. "No value" is NO (a sentinel below every real
+# length); has(x) tells them apart, and the m* helpers mirror Taffy's
+# MaybeMath (an absent operand leaves the other side unchanged).
+
+pub const NO: f64 = -1.0e300
+pub fn has(x: f64) -> bool = x > -1.0e299
+fn orv(a: f64, b: f64) -> f64 = if has(a) then a else b
+fn orz(a: f64) -> f64 = if has(a) then a else 0.0
+fn fmax(a: f64, b: f64) -> f64 = if a > b then a else b
+fn fmin(a: f64, b: f64) -> f64 = if a < b then a else b
+fn mmax(a: f64, b: f64) -> f64 = if has(a) and has(b) then fmax(a, b) else a
+fn mmin(a: f64, b: f64) -> f64 = if has(a) and has(b) then fmin(a, b) else a
+fn madd(a: f64, b: f64) -> f64 = if has(a) and has(b) then a + b else a
+fn msub(a: f64, b: f64) -> f64 = if has(a) and has(b) then a - b else a
+# clamp: max wins over min only when min > max is not the case (CSS: min wins)
+fn mclamp(x: f64, lo: f64, hi: f64) -> f64
+    if not has(x)
+        return x
+    var r = x
+    if has(hi) and r > hi
+        r = hi
+    if has(lo) and r < lo
+        r = lo
+    return r
+fn rnd(x: f64) -> f64 = (x + 0.5).floor()
+
+# Available space: kind DEF (a length), MINC or MAXC.
+const DEF: i64 = 0
+const MINC: i64 = 1
+const MAXC: i64 = 2
+pub struct Av
+    k: i64
+    v: f64
+fn adef(v: f64) -> Av = Av(k: DEF, v: v)
+fn amin() -> Av = Av(k: MINC, v: 0.0)
+fn amax() -> Av = Av(k: MAXC, v: 0.0)
+fn aval(a: &Av) -> f64 = if a.k == DEF then a.v else NO
+fn asub(a: &Av, b: f64) -> Av = if a.k == DEF and has(b) then adef(a.v - b) else copy(a)
+fn amaxz(a: &Av) -> Av = if a.k == DEF and a.v < 0.0 then adef(0.0) else copy(a)
+fn aset(a: &Av, b: f64) -> Av = if has(b) then adef(b) else copy(a)
+
+# Style values: kind and number.
+const AUTO: i64 = 0
+const PX: i64 = 1
+const PCT: i64 = 2
+const MINCONT: i64 = 3
+const MAXCONT: i64 = 4
+const FITCONT: i64 = 5
+const STRETCH: i64 = 6
+const CONTENT: i64 = 7
+const FR: i64 = 8
+pub struct Len
+    k: i64
+    v: f64
+fn lauto() -> Len = Len(k: AUTO, v: 0.0)
+fn lzero() -> Len = Len(k: PX, v: 0.0)
+# resolve a length against a basis (auto and keywords give NO)
+fn res(l: &Len, basis: f64) -> f64
+    if l.k == PX
+        return l.v
+    if l.k == PCT and has(basis)
+        return l.v * basis
+    return NO
+fn res0(l: &Len, basis: f64) -> f64 = orz(res(l, basis))
+
+# decimal number (sign, digits, optional fraction)
+fn num(s: &text) -> f64
+    var i: usize = 0
+    var neg = false
+    if s.len() > 0 and s[0] == 45
+        neg = true
+        i = 1
+    var ip: i64 = 0
+    while i < s.len() and s[i] >= 48 and s[i] <= 57 bound 64
+        ip = ip * 10 + (s[i] as i64 - 48)
+        i += 1
+    var r = ip as f64
+    if i < s.len() and s[i] == 46
+        i += 1
+        var sc = 0.1
+        while i < s.len() and s[i] >= 48 and s[i] <= 57 bound 64
+            r = r + ((s[i] as i64 - 48) as f64) * sc
+            sc = sc / 10.0
+            i += 1
+    return if neg then -r else r
+fn parse_len(s: &text) -> Len
+    let t = s.strip()
+    if t == "auto" or t == ""
+        return lauto()
+    if t == "min-content"
+        return Len(k: MINCONT, v: 0.0)
+    if t == "max-content"
+        return Len(k: MAXCONT, v: 0.0)
+    if t == "fit-content"
+        return Len(k: FITCONT, v: 0.0)
+    if t == "stretch"
+        return Len(k: STRETCH, v: 0.0)
+    if t == "content"
+        return Len(k: CONTENT, v: 0.0)
+    if t.endswith("%")
+        return Len(k: PCT, v: num(&t) / 100.0)
+    if t.endswith("fr")
+        return Len(k: FR, v: num(&t))
+    return Len(k: PX, v: num(&t))
+
+# Display, position and other keywords as small integers.
+const D_FLEX: i64 = 0
+const D_BLOCK: i64 = 1
+const D_GRID: i64 = 2
+const D_NONE: i64 = 3
+const D_FLOWROOT: i64 = 4
+const P_REL: i64 = 0
+const P_ABS: i64 = 1
+const P_FIXED: i64 = 2
+const P_STATIC: i64 = 3
+const O_VIS: i64 = 0
+const O_HIDDEN: i64 = 1
+const O_SCROLL: i64 = 2
+const O_CLIP: i64 = 3
+const O_AUTO: i64 = 4
+# alignment keywords (NA: not set / normal)
+const A_NA: i64 = -1
+const A_START: i64 = 0
+const A_END: i64 = 1
+const A_FSTART: i64 = 2
+const A_FEND: i64 = 3
+const A_CENTER: i64 = 4
+const A_BASE: i64 = 5
+const A_STRETCH: i64 = 6
+const A_SBETWEEN: i64 = 7
+const A_SEVENLY: i64 = 8
+const A_SAROUND: i64 = 9
+const A_LEFT: i64 = 10
+const A_RIGHT: i64 = 11
+
+pub struct Style
+    display: i64
+    rtl: bool
+    position: i64
+    border_box: bool
+    ovx: i64
+    ovy: i64
+    sbw: f64
+    float: i64
+    clear: i64
+    contain: text
+    vertical: bool
+    text_align: text
+    size: List[Len]
+    min: List[Len]
+    max: List[Len]
+    inset: List[Len]
+    margin: List[Len]
+    padding: List[Len]
+    border: List[Len]
+    gap: List[Len]
+    ratio: f64
+    align_items: i64
+    align_self: i64
+    justify_items: i64
+    justify_self: i64
+    align_content: i64
+    justify_content: i64
+    flex_dir: i64
+    flex_wrap: i64
+    line_count: i64
+    grow: f64
+    shrink: f64
+    basis: Len
+    auto_flow: text
+    rows: text
+    cols: text
+    auto_rows: text
+    auto_cols: text
+    row_start: text
+    row_end: text
+    col_start: text
+    col_end: text
+
+fn align_kw(s: &text) -> i64
+    if s == "start"
+        return A_START
+    if s == "end"
+        return A_END
+    if s == "flex-start"
+        return A_FSTART
+    if s == "flex-end"
+        return A_FEND
+    if s == "center"
+        return A_CENTER
+    if s == "baseline"
+        return A_BASE
+    if s == "stretch"
+        return A_STRETCH
+    if s == "space-between"
+        return A_SBETWEEN
+    if s == "space-evenly"
+        return A_SEVENLY
+    if s == "space-around"
+        return A_SAROUND
+    if s == "left"
+        return A_LEFT
+    if s == "right"
+        return A_RIGHT
+    return A_NA
+fn ov_kw(s: &text) -> i64
+    if s == "hidden"
+        return O_HIDDEN
+    if s == "scroll"
+        return O_SCROLL
+    if s == "clip"
+        return O_CLIP
+    if s == "auto"
+        return O_AUTO
+    return O_VIS
+
+fn style_default() -> Style
+    return Style(display: D_FLEX, rtl: false, position: P_REL, border_box: true, ovx: O_VIS, ovy: O_VIS, sbw: 0.0, float: 0, clear: 0, contain: "", vertical: false, text_align: "", size: [lauto(), lauto()], min: [lauto(), lauto()], max: [lauto(), lauto()], inset: [lauto(), lauto(), lauto(), lauto()], margin: [lzero(), lzero(), lzero(), lzero()], padding: [lzero(), lzero(), lzero(), lzero()], border: [lzero(), lzero(), lzero(), lzero()], gap: [lzero(), lzero()], ratio: NO, align_items: A_NA, align_self: A_NA, justify_items: A_NA, justify_self: A_NA, align_content: A_NA, justify_content: A_NA, flex_dir: 0, flex_wrap: 0, line_count: 1, grow: 0.0, shrink: 1.0, basis: lauto(), auto_flow: "", rows: "", cols: "", auto_rows: "", auto_cols: "", row_start: "", row_end: "", col_start: "", col_end: "")
+
+# Rect sides are ordered left, right, top, bottom; sizes width, height.
+const L: usize = 0
+const R: usize = 1
+const T: usize = 2
+const B: usize = 3
+
+fn set_prop(s: &mut Style, k: &text, v: text)
+    if k == "display"
+        if v == "block"
+            s.display = D_BLOCK
+        elif v == "grid"
+            s.display = D_GRID
+        elif v == "none"
+            s.display = D_NONE
+        elif v == "flow-root"
+            s.display = D_FLOWROOT
+        else
+            s.display = D_FLEX
+    elif k == "direction"
+        s.rtl = v == "rtl"
+    elif k == "position"
+        if v == "absolute"
+            s.position = P_ABS
+        elif v == "fixed"
+            s.position = P_FIXED
+        elif v == "static"
+            s.position = P_STATIC
+        else
+            s.position = P_REL
+    elif k == "box-sizing"
+        s.border_box = v != "content-box"
+    elif k == "overflow-x"
+        s.ovx = ov_kw(&v)
+    elif k == "overflow-y"
+        s.ovy = ov_kw(&v)
+    elif k == "scrollbar-width"
+        if v == "none"
+            s.sbw = 0.0
+        elif v == "thin"
+            s.sbw = 11.0
+        else
+            s.sbw = 15.0
+    elif k == "float"
+        if v == "left"
+            s.float = 1
+        elif v == "right"
+            s.float = 2
+        elif v == "inline-start"
+            s.float = 3
+        elif v == "inline-end"
+            s.float = 4
+        else
+            s.float = 0
+    elif k == "clear"
+        if v == "left"
+            s.clear = 1
+        elif v == "right"
+            s.clear = 2
+        elif v == "both"
+            s.clear = 3
+        elif v == "inline-start"
+            s.clear = 4
+        elif v == "inline-end"
+            s.clear = 5
+        else
+            s.clear = 0
+    elif k == "contain"
+        s.contain = v
+    elif k == "writing-mode"
+        s.vertical = v.contains("vertical")
+    elif k == "text-align"
+        s.text_align = v
+    elif k == "width"
+        s.size[0] = parse_len(&v)
+    elif k == "height"
+        s.size[1] = parse_len(&v)
+    elif k == "min-width"
+        s.min[0] = parse_len(&v)
+    elif k == "min-height"
+        s.min[1] = parse_len(&v)
+    elif k == "max-width"
+        s.max[0] = parse_len(&v)
+    elif k == "max-height"
+        s.max[1] = parse_len(&v)
+    elif k == "left"
+        s.inset[L] = parse_len(&v)
+    elif k == "right"
+        s.inset[R] = parse_len(&v)
+    elif k == "top"
+        s.inset[T] = parse_len(&v)
+    elif k == "bottom"
+        s.inset[B] = parse_len(&v)
+    elif k == "margin-left"
+        s.margin[L] = parse_len(&v)
+    elif k == "margin-right"
+        s.margin[R] = parse_len(&v)
+    elif k == "margin-top"
+        s.margin[T] = parse_len(&v)
+    elif k == "margin-bottom"
+        s.margin[B] = parse_len(&v)
+    elif k == "padding-left"
+        s.padding[L] = parse_len(&v)
+    elif k == "padding-right"
+        s.padding[R] = parse_len(&v)
+    elif k == "padding-top"
+        s.padding[T] = parse_len(&v)
+    elif k == "padding-bottom"
+        s.padding[B] = parse_len(&v)
+    elif k == "border-left"
+        s.border[L] = parse_len(&v)
+    elif k == "border-right"
+        s.border[R] = parse_len(&v)
+    elif k == "border-top"
+        s.border[T] = parse_len(&v)
+    elif k == "border-bottom"
+        s.border[B] = parse_len(&v)
+    elif k == "column-gap"
+        s.gap[0] = parse_len(&v)
+    elif k == "row-gap"
+        s.gap[1] = parse_len(&v)
+    elif k == "aspect-ratio"
+        if v.contains("/")
+            let p = v.split("/")
+            let a = p[0].strip()
+            let b = p[1].strip()
+            s.ratio = num(&a) / num(&b)
+        else
+            s.ratio = num(&v)
+    elif k == "align-items"
+        s.align_items = align_kw(&v)
+    elif k == "align-self"
+        s.align_self = align_kw(&v)
+    elif k == "justify-items"
+        s.justify_items = align_kw(&v)
+    elif k == "justify-self"
+        s.justify_self = align_kw(&v)
+    elif k == "align-content"
+        s.align_content = align_kw(&v)
+    elif k == "justify-content"
+        s.justify_content = align_kw(&v)
+    elif k == "flex-direction"
+        if v == "row-reverse"
+            s.flex_dir = 1
+        elif v == "column"
+            s.flex_dir = 2
+        elif v == "column-reverse"
+            s.flex_dir = 3
+        else
+            s.flex_dir = 0
+    elif k == "flex-wrap"
+        if v == "wrap"
+            s.flex_wrap = 1
+        elif v == "wrap-reverse"
+            s.flex_wrap = 2
+        else
+            s.flex_wrap = 0
+    elif k == "flex-line-count"
+        s.line_count = v.toint()
+    elif k == "flex-grow"
+        s.grow = num(&v)
+    elif k == "flex-shrink"
+        s.shrink = num(&v)
+    elif k == "flex-basis"
+        s.basis = parse_len(&v)
+    elif k == "grid-auto-flow"
+        s.auto_flow = v
+    elif k == "grid-template-rows"
+        s.rows = v
+    elif k == "grid-template-columns"
+        s.cols = v
+    elif k == "grid-auto-rows"
+        s.auto_rows = v
+    elif k == "grid-auto-columns"
+        s.auto_cols = v
+    elif k == "grid-row-start"
+        s.row_start = v
+    elif k == "grid-row-end"
+        s.row_end = v
+    elif k == "grid-column-start"
+        s.col_start = v
+    elif k == "grid-column-end"
+        s.col_end = v
+
+# The tree: node 0 is the root; kids in document order. A node is a text
+# leaf when has_text is set (Ahem font: 10px squares, ZWSP is a break).
+pub struct Tree
+    st: List[Style]
+    kids: List[List[i64]]
+    parent: List[i64]
+    has_text: List[bool]
+    txt: List[List[i64]]
+    # unrounded layout: x, y, w, h, and content (scroll) size
+    x: List[f64]
+    y: List[f64]
+    w: List[f64]
+    h: List[f64]
+    cw: List[f64]
+    ch: List[f64]
+    rows_out: List[text]
+    cols_out: List[text]
+
+fn empty_i() -> List[i64] = []
+# parse "d:k;p=v;...#text" nodes joined by "/"
+pub fn parse_tree(s: &text) -> Tree
+    var t = Tree(st: [], kids: [], parent: [], has_text: [], txt: [], x: [], y: [], w: [], h: [], cw: [], ch: [], rows_out: [], cols_out: [])
+    var stack: List[i64] = []
+    for item in s.split("/")
+        var body = copy(item)
+        var tx = ""
+        var is_text = false
+        let hp = item.split("#")
+        if hp.len() > 1
+            body = copy(hp[0])
+            tx = copy(hp[1])
+        let dp = body.split(":")
+        let depth = dp[0].toint()
+        var rest = copy(dp[1])
+        var k = 1
+        if dp.len() > 2
+            var j: usize = 2
+            while j < dp.len() bound 64
+                rest = rest + ":" + dp[j]
+                j += 1
+        var st = style_default()
+        var first = true
+        for pv in rest.split(";")
+            if first
+                is_text = pv == "t"
+                first = false
+            elif pv.contains("=")
+                let q = pv.split("=")
+                set_prop(&mut st, &q[0], copy(q[1]))
+        let n = t.st.len() as i64
+        while stack.len() as i64 > depth bound 4096
+            stack.pop()
+        let p = if stack.len() > 0 then stack[stack.len() - 1] else -1
+        t.st.push(st)
+        t.kids.push(empty_i())
+        t.parent.push(p)
+        t.has_text.push(is_text)
+        var lens: List[i64] = []
+        if is_text
+            for seg in tx.split("|")
+                lens.push(seg.len() as i64)
+        t.txt.push(lens)
+        t.x.push(0.0)
+        t.y.push(0.0)
+        t.w.push(0.0)
+        t.h.push(0.0)
+        t.cw.push(0.0)
+        t.ch.push(0.0)
+        t.rows_out.push("")
+        t.cols_out.push("")
+        if p >= 0
+            t.kids[p as usize].push(n)
+        stack.push(n)
+        k += 0
+    return t
