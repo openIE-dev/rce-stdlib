@@ -2532,6 +2532,11 @@ fn oof_pos(cb: f64, is: f64, ie: f64, m: &List[f64], rm: &List[f64], im: &List[f
         else
             st = align_line(la, lb, mb, se_start)
     return st + rm[0]
+fn block_edge(k: i64, rtl: bool) -> i64
+    if k == A_CENTER
+        return 2
+    let sp = (not (k == A_END or k == A_FEND)) != rtl
+    return if sp then 0 else 1
 fn main_edge(k: i64, fr: bool, mrtl: bool) -> i64
     if k == A_START
         return if mrtl then 1 else 0
@@ -2628,10 +2633,26 @@ fn static_pos(t: &Tree, p: i64, ch: i64, w: f64, h: f64) -> List[f64]
             hedge = ck
             hsafe = asafe
     else
-        hsa = t.x[ch as usize]
-        hse = hsa
+        hsa = pins[L] + ppad[L]
+        hse = w - pins[R] - ppad[R]
         vsa = t.y[ch as usize]
         vse = vsa
+        var j0 = if akw(cs.justify_self) != A_NA then cs.justify_self else s.justify_items
+        var jk = akw(j0)
+        let jflip = cs.rtl != s.rtl
+        if jk == A_SSTART
+            jk = if jflip then A_END else A_START
+        elif jk == A_SEND
+            jk = if jflip then A_START else A_END
+        hedge = block_edge(jk, s.rtl)
+        hsafe = j0 >= SAFE
+        var vk = akw(cs.align_self)
+        if vk == A_SSTART
+            vk = A_START
+        elif vk == A_SEND
+            vk = A_END
+        vedge = block_edge(vk, false)
+        vsafe = cs.align_self >= SAFE
     return [hsa, hse, hedge as f64, if hsafe then 1.0 else 0.0, vsa, vse, vedge as f64, if vsafe then 1.0 else 0.0]
 # collect positioned descendants claimed by the owner, through static boxes
 # mode 0: absolute boxes for a positioned owner; 1: root pass (fixed, and absolute with no positioned ancestor); 2: root pass below a positioned box (fixed only)
