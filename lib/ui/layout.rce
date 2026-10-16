@@ -1725,8 +1725,6 @@ fn flex_prelim(t: &mut Tree, n: i64, inp: &In) -> Out bound 4096
     return o
 
 fn grid_layout(t: &mut Tree, n: i64, inp: &In) -> Out bound 4096 = leaf_layout(t, n, inp)
-fn oof_layout(t: &mut Tree, n: i64, o: &mut Out) bound 4096
-    pass
 
 fn set_box(t: &mut Tree, n: i64, bor: &List[f64], ovx: i64, ovy: i64, sbw: f64)
     let i = n as usize
@@ -2271,3 +2269,219 @@ fn block_content_width(t: &mut Tree, kids: &List[i64], ccb: &List[f64], aw: &Av)
             w = fmax(w, hsum(&cpb)) + xm
             mw = fmax(mw, w)
     return mw
+
+# ---- positioned boxes (Taffy compute/oof.rs, static positions simplified) ----
+# axis: cb size, insets (NO = auto), margins (NO = auto), static area start/end and
+# edge (0 start, 1 end, 2 center), alignment (0 normal 1 stretch 2 start 3 center 4 end),
+# safe, inline, reversed
+fn imcb(cb: f64, is: f64, ie: f64, sa: f64, se: f64, edge: i64, rev: bool) -> List[f64]
+    var a = 0.0
+    var b = cb
+    var weak_start = false
+    if has(is) and has(ie)
+        a = is
+        b = cb - ie
+        weak_start = rev
+    elif has(is)
+        a = is
+    elif has(ie)
+        b = cb - ie
+        weak_start = true
+    else
+        if edge == 0
+            a = sa
+        elif edge == 1
+            b = se
+        else
+            let c = (sa + se) / 2.0
+            if c.abs() <= (cb - c).abs()
+                b = 2.0 * c
+            else
+                a = cb - 2.0 * (cb - c)
+        weak_start = rev
+    if b < a
+        if weak_start
+            a = b
+        else
+            b = a
+    return [a, b]
+fn align_line(a: f64, b: f64, size: f64, edge: i64) -> f64
+    if edge == 0
+        return a
+    if edge == 1
+        return b - size
+    return (a + b - size) / 2.0
+fn oof_margins(m: &List[f64], is: f64, ie: f64, im: &List[f64], size: f64, inline: bool, rev: bool) -> List[f64]
+    let both = has(is) and has(ie)
+    let free = im[1] - im[0] - size
+    if has(m[0]) and has(m[1])
+        return copy(m)
+    if not both
+        return [orz(m[0]), orz(m[1])]
+    if has(m[0])
+        return [m[0], free - m[0]]
+    if has(m[1])
+        return [free - m[1], m[1]]
+    if free < 0.0 and inline
+        return if rev then [free, 0.0] else [0.0, free]
+    return [free / 2.0, free / 2.0]
+fn oof_pos(cb: f64, is: f64, ie: f64, m: &List[f64], rm: &List[f64], im: &List[f64], sa: f64, se: f64, edge: i64, al: i64, safe: bool, rev: bool, size: f64, scroll: bool) -> f64
+    let mb = size + rm[0] + rm[1]
+    let se_start = if rev then 1 else 0
+    if not has(is) and not has(ie)
+        return align_line(sa, se, mb, edge) + rm[0]
+    if has(is) and not has(ie)
+        return im[0] + rm[0]
+    if has(ie) and not has(is)
+        return im[1] - size - rm[1]
+    if not has(m[0]) or not has(m[1])
+        return im[0] + rm[0]
+    let isz = im[1] - im[0]
+    var pe = 0
+    if al == 3
+        pe = 2
+    elif al == 4
+        pe = if rev then 0 else 1
+    else
+        pe = if rev then 1 else 0
+    var st = 0.0
+    if safe
+        st = align_line(im[0], im[1], mb, if mb > isz then se_start else pe)
+    elif mb <= isz or al == 0
+        st = align_line(im[0], im[1], mb, pe)
+    else
+        var la = fmin(im[0], 0.0)
+        var lb = fmax(im[1], cb)
+        if scroll
+            if rev
+                la = -1.0e300
+            else
+                lb = 1.0e300
+        if mb <= lb - la
+            st = fmax(fmin(align_line(im[0], im[1], mb, pe), lb - mb), la)
+        else
+            st = align_line(la, lb, mb, se_start)
+    return st + rm[0]
+fn oof_align(a: i64) -> i64
+    let k = akw(a)
+    if k == A_NA
+        return 0
+    if k == A_STRETCH
+        return 1
+    if k == A_CENTER
+        return 3
+    if k == A_END or k == A_FEND or k == A_SEND
+        return 4
+    return 2
+
+fn oof_layout(t: &mut Tree, n: i64, o: &mut Out) bound 4096
+    let s = sty(t, n)
+    let bor = copy(t.bord[n as usize])
+    let pw = o.w
+    let rb = rect0(&s.border, pw)
+    let gx = if s.ovy == O_SCROLL then s.sbw else 0.0
+    let gy = if s.ovx == O_SCROLL then s.sbw else 0.0
+    let ins = [rb[L] + (if s.rtl then gx else 0.0), rb[R] + (if s.rtl then 0.0 else gx), rb[T], rb[B] + gy]
+    let aw = o.w - hsum(&ins)
+    let ah = o.h - vsum(&ins)
+    let pad = rect0(&s.padding, pw)
+    for ch in copy(t.kids[n as usize])
+        let cs = sty(t, ch)
+        if is_oof(cs.position) and cs.display != D_NONE
+            # static position relative to the area
+            var sx = 0.0
+            var sy = 0.0
+            if s.display == D_BLOCK or s.display == D_FLOWROOT
+                sx = t.x[ch as usize] - ins[L]
+                sy = t.y[ch as usize] - ins[T]
+            else
+                sx = if s.rtl then aw - pad[R] else pad[L]
+                sy = pad[T]
+            let m = rect_opt(&cs.margin, aw, aw)
+            let cpd = rect0(&cs.padding, aw)
+            let cbd = rect0(&cs.border, aw)
+            let cpb = radd(&cpd, &cbd)
+            let pbs = [hsum(&cpb), vsum(&cpb)]
+            let bsa = if cs.border_box then [0.0, 0.0] else copy(pbs)
+            let il = res(&cs.inset[L], aw)
+            let ir = res(&cs.inset[R], aw)
+            let it = res(&cs.inset[T], ah)
+            let ib = res(&cs.inset[B], ah)
+            let a3 = sz_res(&cs.size, aw, ah)
+            let ssz = sz_add(sz_ratio(a3, cs.ratio), copy(bsa))
+            let a1 = sz_res(&cs.min, aw, ah)
+            var mn = sz_max(sz_or(sz_add(sz_ratio(a1, cs.ratio), copy(bsa)), copy(pbs)), copy(pbs))
+            let a2 = sz_res(&cs.max, aw, ah)
+            let mx = sz_add(sz_ratio(a2, cs.ratio), copy(bsa))
+            var kd = sz_clamp(ssz, copy(mn), copy(mx))
+            var js = if akw(cs.justify_self) != A_NA then cs.justify_self else A_NA
+            let flip = cs.rtl != s.rtl
+            if akw(js) == A_SSTART
+                js = js - A_SSTART + (if flip then A_END else A_START)
+            elif akw(js) == A_SEND
+                js = js - A_SEND + (if flip then A_START else A_END)
+            var als = cs.align_self
+            if akw(als) == A_SSTART
+                als = als - A_SSTART + A_START
+            elif akw(als) == A_SEND
+                als = als - A_SEND + A_END
+            let hal = oof_align(js)
+            let val = oof_align(als)
+            let hedge = if s.rtl then 1 else 0
+            let himc = imcb(aw, il, ir, sx, sx, hedge, s.rtl)
+            let vimc = imcb(ah, it, ib, sy, sy, 0, false)
+            let sfw = fmax(himc[1] - himc[0] - orz(m[L]) - orz(m[R]), 0.0)
+            let sfh = fmax(vimc[1] - vimc[0] - orz(m[T]) - orz(m[B]), 0.0)
+            let avw = mclamp(sfw, mn[0], mx[0])
+            let avh = mclamp(sfh, mn[1], mx[1])
+            let swl = copy(cs.size[0])
+            let shl = copy(cs.size[1])
+            if swl.k >= MINCONT and swl.k <= STRETCH and not has(kd[0])
+                let strw = fmax(aw - orz(il) - orz(ir) - orz(m[L]) - orz(m[R]), 0.0)
+                let r = sizing_kw(&swl, strw, aw)
+                if r[0] == 1.0
+                    kd[0] = r[1]
+                elif r[0] == 2.0
+                    let strh = fmax(ah - orz(it) - orz(ib) - orz(m[T]) - orz(m[B]), 0.0)
+                    kd[0] = measure_axis(t, ch, NO, kd[1], aw, ah, kw_av(r[1]), adef(strh), SZ_CONTENT, 0)
+            if shl.k >= MINCONT and shl.k <= STRETCH and not has(kd[1])
+                let strh = fmax(ah - orz(it) - orz(ib) - orz(m[T]) - orz(m[B]), 0.0)
+                let r = sizing_kw(&shl, strh, ah)
+                if r[0] == 1.0
+                    kd[1] = r[1]
+                elif r[0] == 2.0
+                    let wav = if has(kd[0]) then adef(kd[0]) else adef(avw)
+                    kd[1] = measure_axis(t, ch, kd[0], NO, aw, ah, wav, kw_av(r[1]), SZ_CONTENT, 1)
+            kd = sz_clamp(sz_ratio(kd, cs.ratio), copy(mn), copy(mx))
+            let stw = not has(kd[0]) and has(il) and has(ir) and (hal == 1 or hal == 0)
+            let sth = not has(kd[1]) and has(it) and has(ib) and (val == 1 or val == 0)
+            let sar = if stw and sth and hal == 1 and val == 1 then NO else cs.ratio
+            if stw
+                kd[0] = sfw
+                kd = sz_clamp(sz_ratio(kd, sar), copy(mn), copy(mx))
+            if not has(kd[1]) and sth
+                kd[1] = sfh
+                kd = sz_clamp(sz_ratio(kd, sar), copy(mn), copy(mx))
+            var fs = copy(kd)
+            if not has(kd[0]) or not has(kd[1])
+                let mbs = measure_both(t, ch, kd[0], kd[1], aw, ah, adef(avw), adef(avh), SZ_CONTENT)
+                fs = [orv(kd[0], mbs[0]), orv(kd[1], mbs[1])]
+            fs = sz_clamp(fs, copy(mn), copy(mx))
+            var ci2 = mkin(fs[0], fs[1], aw, ah, adef(avw), adef(avh), SZ_CONTENT, AX_BOTH, RUN_PERFORM)
+            let lo = child(t, ch, &ci2)
+            let hm = [m[L], m[R]]
+            let vm = [m[T], m[B]]
+            let hrm = oof_margins(&hm, il, ir, &himc, fs[0], true, s.rtl)
+            let vrm = oof_margins(&vm, it, ib, &vimc, fs[1], false, false)
+            let x = oof_pos(aw, il, ir, &hm, &hrm, &himc, sx, sx, hedge, hal, js >= SAFE, s.rtl, fs[0], is_scroll_container(s.ovx)) + ins[L]
+            let y = oof_pos(ah, it, ib, &vm, &vrm, &vimc, sy, sy, 0, val, als >= SAFE, false, fs[1], is_scroll_container(s.ovy)) + ins[T]
+            set_layout(t, ch, x, y, fs[0], fs[1], lo.orr, lo.ob)
+            set_box(t, ch, &cbd, cs.ovx, cs.ovy, cs.sbw)
+            let cx = if s.rtl then o.w - (x + fs[0]) - bor[R] else x - bor[L]
+            let oc = overflow_contrib(cx, y - bor[T], fs[0], fs[1], &lo, &cs, is_scroll_container(s.ovx) or is_scroll_container(s.ovy))
+            let u0 = [o.ol, o.orr, o.ot, o.ob]
+            let u = runion(&u0, &oc)
+            o.ol = u[0]
+            o.orr = u[1]
+            o.ot = u[2]
+            o.ob = u[3]
